@@ -1,4 +1,3 @@
-# app.py
 import os
 
 from flask import Flask, request, abort
@@ -6,6 +5,8 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
+# 強制確保載入 bot_core，讓 _load_knowledge() 一定執行
+import bot_core
 from bot_core import build_reply
 
 app = Flask(__name__)

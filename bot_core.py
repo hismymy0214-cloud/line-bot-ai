@@ -1,19 +1,27 @@
-# bot_core.py
 import os
 import re
 import pandas as pd
+
+print("[DEBUG] bot_core.py loaded!")
 
 # 設定訓練檔路徑
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.environ.get("TRAINING_FILE", "training.xlsx")
 DATA_PATH = os.path.join(BASE_DIR, DATA_FILE)
 
+print(f"[DEBUG] Expect training file at: {DATA_PATH}")
+
 
 def _load_knowledge() -> pd.DataFrame:
     """讀取訓練檔，如果找不到就回傳空的 DataFrame。"""
+
+    print(f"[DEBUG] Trying to load training file at: {DATA_PATH}")
+
     try:
         df = pd.read_excel(DATA_PATH)
-    except FileNotFoundError:
+        print(f"[DEBUG] File loaded successfully! Rows={len(df)}, Columns={df.columns.tolist()}")
+    except Exception as e:
+        print(f"[ERROR] Failed to read Excel file: {e}")
         return pd.DataFrame(columns=["category", "year", "unit", "item", "value", "description"])
 
     df = df.fillna("")
@@ -21,12 +29,16 @@ def _load_knowledge() -> pd.DataFrame:
     # 確保欄位都存在
     for col in ["category", "year", "unit", "item", "value", "description"]:
         if col not in df.columns:
+            print(f"[WARN] Column '{col}' missing, creating empty column.")
             df[col] = ""
 
     return df
 
 
+# ⚠ 載入資料（Render 啟動時就會執行）
 _KNOWLEDGE = _load_knowledge()
+
+print(f"[DEBUG] Knowledge loaded. Total rows: {len(_KNOWLEDGE)}")
 
 
 def _extract_year(text: str):
@@ -38,13 +50,14 @@ def _extract_year(text: str):
 
 
 def _find_best_row(question: str):
-    """很簡單的規則比對，從訓練表中挑一列當答案。"""
+    """簡單比對訓練資料中最接近的那一列。"""
     text = question.strip()
     if not text:
         return None
 
     df = _KNOWLEDGE
     if df.empty:
+        print("[DEBUG] Knowledge DataFrame is EMPTY.")
         return None
 
     candidates = df
@@ -67,14 +80,14 @@ def _find_best_row(question: str):
             break
 
     if candidates.empty:
+        print("[DEBUG] No matching candidates found.")
         return None
 
-    # 目前先取第一筆
     return candidates.iloc[0]
 
 
 def build_reply(question: str) -> str:
-    """對外提供給 app.py 使用的函式。"""
+    """提供給 LINE Bot 的回覆函式。"""
     row = _find_best_row(question)
     if row is None:
         return "抱歉，我在訓練資料裡找不到這個問題的答案，可以換個說法或問別的問題喔。"
