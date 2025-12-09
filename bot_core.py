@@ -5,7 +5,7 @@ import pandas as pd
 
 # 設定訓練檔路徑
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_FILE = os.environ.get("TRAINING_FILE", "訓練檔(主計三連環).xlsx")
+DATA_FILE = os.environ.get("TRAINING_FILE", "training.xlsx")
 DATA_PATH = os.path.join(BASE_DIR, DATA_FILE)
 
 
