@@ -3,3 +3,4 @@ line-bot-sdk
 openpyxl
 pandas
 gunicorn
+rapidfuzz
