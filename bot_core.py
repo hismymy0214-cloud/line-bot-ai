@@ -5,6 +5,12 @@ from rapidfuzz import fuzz, process
 
 print("[DEBUG] bot_core.py loaded!")
 
+# -----------------------------
+# 模糊比對分數門檻
+# -----------------------------
+UNIT_MIN_SCORE = 70   # 單位：相似度至少 70
+ITEM_MIN_SCORE = 85   # 項目：相似度至少 85（不清楚就直接當作查不到）
+
 # 設定訓練檔路徑
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.environ.get("TRAINING_FILE", "training.xlsx")
@@ -60,20 +66,26 @@ def _extract_year(text: str):
 
 def _fuzzy_match(question: str, choices: list):
     """
-    模糊比對工具：回傳最相似的字串
+    模糊比對工具：回傳 (最相似的字串, 分數)。
+    找不到則回 (None, 0)。
     """
     if not choices:
-        return None
+        return None, 0
+
     result = process.extractOne(question, choices, scorer=fuzz.partial_ratio)
-    if result and result[1] >= 60:  # 相似度門檻 60 分
-        return result[0]
-    return None
+    if not result:
+        return None, 0
+
+    best_choice, score, *_ = result  # rapidfuzz.extractOne 回傳 (choice, score, index)
+    return best_choice, score
 
 
 def _find_best_row(question: str):
     """
-    走原本的「自然語言 + 模糊比對」流程，
-    依序比對 year、unit、item，回傳最符合的那一列。
+    「自然語言 + 模糊比對」查詢流程：
+    1. 先用年度過濾
+    2. 模糊比對單位；若分數太低，當作查不到
+    3. 模糊比對項目；若分數太低（代表沒有明確指定項目），當作查不到
     """
     text = question.strip()
     if not text:
@@ -86,27 +98,41 @@ def _find_best_row(question: str):
 
     candidates = df.copy()
 
-    # 年度（仍維持精準比對）
+    # 年度（維持精準比對）
     year = _extract_year(text)
     if year:
         candidates = candidates[candidates["year"].astype(str) == year]
 
-    # 🔍 模糊比對 unit
-    units = candidates["unit"].unique().tolist()
-    best_unit = _fuzzy_match(text, units)
+    if candidates.empty:
+        print("[DEBUG] No candidates after year filter.")
+        return None
 
-    if best_unit:
-        candidates = candidates[candidates["unit"] == best_unit]
+    # 🔍 模糊比對 unit
+    unit_choices = candidates["unit"].unique().tolist()
+    best_unit, unit_score = _fuzzy_match(text, unit_choices)
+
+    if not best_unit or unit_score < UNIT_MIN_SCORE:
+        # 單位都不確定，就直接放棄
+        print(f"[DEBUG] Unit not matched clearly. score={unit_score}")
+        return None
+
+    candidates = candidates[candidates["unit"] == best_unit]
+    if candidates.empty:
+        print("[DEBUG] No candidates after unit filter.")
+        return None
 
     # 🔍 模糊比對 item
-    items = candidates["item"].unique().tolist()
-    best_item = _fuzzy_match(text, items)
+    item_choices = candidates["item"].unique().tolist()
+    best_item, item_score = _fuzzy_match(text, item_choices)
 
-    if best_item:
-        candidates = candidates[candidates["item"] == best_item]
+    # ⬇⬇⬇ 關鍵：項目如果不夠明確，就視為查不到，不再硬湊 description
+    if not best_item or item_score < ITEM_MIN_SCORE:
+        print(f"[DEBUG] Item not matched clearly. score={item_score}")
+        return None
 
+    candidates = candidates[candidates["item"] == best_item]
     if candidates.empty:
-        print("[DEBUG] No matching candidates found.")
+        print("[DEBUG] No matching candidates after item filter.")
         return None
 
     return candidates.iloc[0]
@@ -165,11 +191,11 @@ def build_reply(question: str) -> str:
     """
     對外主入口：
     - 若使用者輸入格式為：#查 年度,單位,項目 -> 走精準 key 查詢
-    - 否則走原本的自然語言模糊比對
+    - 否則走自然語言模糊比對（若單位或項目不清楚，就回固定道歉訊息）
     """
     text = question.strip()
 
-    #1️⃣ 特殊指令：#查 年度,單位,項目
+    # 1️⃣ 特殊指令：#查 年度,單位,項目
     if text.startswith("#查"):
         payload = text[2:].strip()  # 去掉 "#查"
         # 支援中文、英文逗號
