@@ -9,7 +9,7 @@ print("[DEBUG] bot_core.py loaded!")
 # 模糊比對分數門檻
 # -----------------------------
 UNIT_MIN_SCORE = 70   # 單位：相似度至少 70
-ITEM_MIN_SCORE = 85   # 項目：相似度至少 85（不清楚就直接當作查不到）
+ITEM_MIN_SCORE = 75   # 項目：相似度至少 75（放寬一點，避免太容易被當作抓不到）
 
 # 設定訓練檔路徑
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -64,6 +64,22 @@ def _extract_year(text: str):
     return y
 
 
+def _guess_category(text: str):
+    """
+    根據問題文字猜測要用哪一種 category（統計 / 預算 / 決算）。
+    沒猜到就回 None，不強制。
+    """
+    # 全部轉成全形不重要，這裡只看關鍵字
+    if any(k in text for k in ["預算", "預算數", "預算書"]):
+        return "預算"
+    if any(k in text for k in ["決算", "執行數", "實際支出"]):
+        return "決算"
+    if "統計" in text:
+        return "統計"
+    # 沒特別講就不限制
+    return None
+
+
 def _fuzzy_match(question: str, choices: list):
     """
     模糊比對工具：回傳 (最相似的字串, 分數)。
@@ -83,9 +99,10 @@ def _fuzzy_match(question: str, choices: list):
 def _find_best_row(question: str):
     """
     「自然語言 + 模糊比對」查詢流程：
-    1. 先用年度過濾
-    2. 模糊比對單位；若分數太低，當作查不到
-    3. 模糊比對項目；若分數太低（代表沒有明確指定項目），當作查不到
+    1. 先試著用 category（統計 / 預算 / 決算）縮小範圍
+    2. 再用年度過濾
+    3. 模糊比對單位；若分數太低，當作查不到
+    4. 模糊比對項目；若分數太低（代表沒有明確指定項目），當作查不到
     """
     text = question.strip()
     if not text:
@@ -98,18 +115,31 @@ def _find_best_row(question: str):
 
     candidates = df.copy()
 
+    # 先依問題文字猜 category（例如有寫「預算」「決算」）
+    cat = _guess_category(text)
+    if cat:
+        cat_filtered = candidates[candidates["category"] == cat]
+        if not cat_filtered.empty:
+            candidates = cat_filtered
+            print(f"[DEBUG] Category hint applied: {cat} -> rows={len(candidates)}")
+        else:
+            print(f"[DEBUG] Category hint '{cat}' has no rows, fallback to all categories.")
+
     # 年度（維持精準比對）
     year = _extract_year(text)
     if year:
+        before = len(candidates)
         candidates = candidates[candidates["year"].astype(str) == year]
+        print(f"[DEBUG] Year filter: {year}, rows {before} -> {len(candidates)}")
 
     if candidates.empty:
-        print("[DEBUG] No candidates after year filter.")
+        print("[DEBUG] No candidates after year/category filter.")
         return None
 
     # 🔍 模糊比對 unit
     unit_choices = candidates["unit"].unique().tolist()
     best_unit, unit_score = _fuzzy_match(text, unit_choices)
+    print(f"[DEBUG] Fuzzy unit: best={best_unit}, score={unit_score}")
 
     if not best_unit or unit_score < UNIT_MIN_SCORE:
         # 單位都不確定，就直接放棄
@@ -124,6 +154,7 @@ def _find_best_row(question: str):
     # 🔍 模糊比對 item
     item_choices = candidates["item"].unique().tolist()
     best_item, item_score = _fuzzy_match(text, item_choices)
+    print(f"[DEBUG] Fuzzy item: best={best_item}, score={item_score}")
 
     # ⬇⬇⬇ 關鍵：項目如果不夠明確，就視為查不到，不再硬湊 description
     if not best_item or item_score < ITEM_MIN_SCORE:
@@ -135,7 +166,9 @@ def _find_best_row(question: str):
         print("[DEBUG] No matching candidates after item filter.")
         return None
 
-    return candidates.iloc[0]
+    row = candidates.iloc[0]
+    print(f"[DEBUG] Final match: category={row['category']}, year={row['year']}, unit={row['unit']}, item={row['item']}")
+    return row
 
 
 def _lookup_by_key(year: str, unit: str, item: str):
