@@ -64,12 +64,30 @@ def _extract_year(text: str):
     return y
 
 
+def _extract_years(text: str):
+    """
+    從字串中抓出所有像 113、112 這種年度，回傳整數 list（已去重、排序）。
+    兩位數年度會自動補成 1xx。
+    """
+    matches = re.findall(r"(\d{2,3})年?", text)
+    years = []
+    for y in matches:
+        if len(y) == 2:
+            y = "1" + y
+        try:
+            years.append(int(y))
+        except ValueError:
+            continue
+    # 去重並排序
+    years = sorted(set(years))
+    return years
+
+
 def _guess_category(text: str):
     """
     根據問題文字猜測要用哪一種 category（統計 / 預算 / 決算）。
     沒猜到就回 None，不強制。
     """
-    # 全部轉成全形不重要，這裡只看關鍵字
     if any(k in text for k in ["預算", "預算數", "預算書"]):
         return "預算"
     if any(k in text for k in ["決算", "執行數", "實際支出"]):
@@ -167,7 +185,11 @@ def _find_best_row(question: str):
         return None
 
     row = candidates.iloc[0]
-    print(f"[DEBUG] Final match: category={row['category']}, year={row['year']}, unit={row['unit']}, item={row['item']}")
+    print(
+        "[DEBUG] Final match: "
+        f"category={row['category']}, year={row['year']}, "
+        f"unit={row['unit']}, item={row['item']}"
+    )
     return row
 
 
@@ -220,13 +242,115 @@ def _format_row(row: pd.Series) -> str:
     return "\n".join(parts)
 
 
+def _build_compare_answer(text: str) -> str | None:
+    """
+    處理『113年跟112年比較』這類問題。
+    回傳比較結果字串；若比對失敗則回傳 None，讓外面走原本流程。
+    """
+    df = _KNOWLEDGE
+    if df.empty:
+        return None
+
+    years = _extract_years(text)
+    if len(years) >= 2:
+        old_year, new_year = years[0], years[-1]
+    elif len(years) == 1:
+        new_year = years[0]
+        old_year = new_year - 1  # 只有一個年份時，假設要跟前一年比
+    else:
+        return None
+
+    # 建一個「只保留新年度」的問題給 _find_best_row 用
+    # 例如：「113年工務局主管預算數跟112年比較」->「113年工務局主管預算數」
+    base_text = text
+    # 把舊年度拿掉，但保留新年度
+    base_text = re.sub(rf"{old_year}年?", "", base_text)
+    # 移除常見比較關鍵詞
+    base_text = re.sub(r"比較|差異|變化|增減|變動|成長|相比|對比|跟|與|和", "", base_text)
+
+    row_new = _find_best_row(base_text)
+    if row_new is None:
+        return None
+
+    cat = row_new.get("category")
+    unit = row_new.get("unit")
+    item = row_new.get("item")
+
+    if not cat or not unit or not item:
+        return None
+
+    # 找舊年度那一列
+    subset = df[
+        (df["category"] == cat)
+        & (df["unit"] == unit)
+        & (df["item"] == item)
+        & (df["year"].astype(str) == str(old_year))
+    ]
+    if subset.empty:
+        print(
+            f"[DEBUG] No old-year row found for compare: "
+            f"cat={cat}, unit={unit}, item={item}, year={old_year}"
+        )
+        return None
+
+    row_old = subset.iloc[0]
+
+    def _to_number(v):
+        try:
+            return float(str(v).replace(",", ""))
+        except Exception:
+            return None
+
+    v_new = _to_number(row_new.get("value"))
+    v_old = _to_number(row_old.get("value"))
+
+    # 若無法轉成數值，就至少把兩年數值列出來
+    if v_new is None or v_old is None:
+        parts = [
+            f"【類別】{cat}",
+            f"【比較項目】{unit}／{item}",
+            f"【{old_year} 年數值】{row_old.get('value', '')}",
+            f"【{new_year} 年數值】{row_new.get('value', '')}",
+        ]
+        if row_old.get("description"):
+            parts.append(f"{old_year} 年說明：{row_old['description']}")
+        if row_new.get("description"):
+            parts.append(f"{new_year} 年說明：{row_new['description']}")
+        return "\n".join(parts)
+
+    diff = v_new - v_old
+    pct = None
+    if v_old != 0:
+        pct = diff / v_old * 100.0
+
+    parts = [
+        f"【類別】{cat}",
+        f"【比較項目】{unit}／{item}",
+        f"【{old_year} 年數值】{v_old:,.0f}",
+        f"【{new_year} 年數值】{v_new:,.0f}",
+        f"【差額】{diff:+,.0f}",
+    ]
+    if pct is not None:
+        parts.append(f"【成長率】{pct:+.2f}%（以 {old_year} 年為基準）")
+
+    if row_old.get("description"):
+        parts.append(f"{old_year} 年說明：{row_old['description']}")
+    if row_new.get("description"):
+        parts.append(f"{new_year} 年說明：{row_new['description']}")
+
+    return "\n".join(parts)
+
+
 def build_reply(question: str) -> str:
     """
     對外主入口：
     - 若使用者輸入格式為：#查 年度,單位,項目 -> 走精準 key 查詢
+    - 若問題中出現「比較／差異／增減／變化……」等字眼，試著做年度比較
     - 否則走自然語言模糊比對（若單位或項目不清楚，就回固定道歉訊息）
     """
     text = question.strip()
+    if not text:
+        return "抱歉，我在訓練資料裡找不到這個問題的答案，可以換個說法或問別的問題喔。"
 
     # 1️⃣ 特殊指令：#查 年度,單位,項目
     if text.startswith("#查"):
@@ -252,7 +376,13 @@ def build_reply(question: str) -> str:
 
         return _format_row(row)
 
-    # 2️⃣ 一般使用者：走模糊查詢
+    # 2️⃣ 比較模式（113 年 vs 112 年…）
+    if any(k in text for k in ["比較", "差異", "變化", "增減", "變動", "成長", "相比", "對比"]):
+        compare_ans = _build_compare_answer(text)
+        if compare_ans is not None:
+            return compare_ans
+
+    # 3️⃣ 一般使用者：走模糊查詢
     row = _find_best_row(text)
     if row is None:
         return "抱歉，我在訓練資料裡找不到這個問題的答案，可以換個說法或問別的問題喔。"
