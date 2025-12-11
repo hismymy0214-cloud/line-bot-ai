@@ -1,316 +1,338 @@
+# bot_core.py
 import os
 import re
-from typing import Dict, Tuple, Optional
+import difflib
+from typing import Optional, Tuple, Dict
 
 import pandas as pd
-import difflib
 
-# ------------------------------------------------------------
-# 讀取訓練資料
-# ------------------------------------------------------------
 
+# === 訓練檔設定 ===
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.environ.get("TRAINING_FILE", "training.xlsx")
 DATA_PATH = os.path.join(BASE_DIR, DATA_FILE)
 
-_KNOWLEDGE: Optional[pd.DataFrame] = None
+# 模糊比對門檻（數值越高越嚴格）
+MIN_UNIT_SCORE = 30.0   # 單位模糊比對最低分數（單年度查詢用）
+MIN_ITEM_SCORE = 30.0   # 項目模糊比對最低分數（單年度查詢用）
+MIN_COMPARE_SEARCH_SCORE = 40.0  # 跨年度比較時，search_text 最低分數
 
 
 def _load_knowledge() -> pd.DataFrame:
-    """讀取 training.xlsx 並快取在記憶體裡。"""
-    global _KNOWLEDGE
-    if _KNOWLEDGE is not None:
-        return _KNOWLEDGE
+    """
+    讀取訓練檔並做前置整理：
+    - 去除前後空白
+    - year / value 轉數值
+    - 建立 series_key（跨年度比較用）
+    - 建立 search_text（之後如果要換嵌入模型也方便）
+    """
+    try:
+        df = pd.read_excel(DATA_PATH)
+    except FileNotFoundError:
+        return pd.DataFrame(columns=[
+            "category", "year", "unit", "item",
+            "value", "description", "keywords",
+            "series_key", "search_text",
+        ])
 
-    print(f"[DEBUG] bot_core loading training file: {DATA_PATH}")
-    df = pd.read_excel(DATA_PATH)
+    # 基本欄位補齊
+    for col in ["category", "year", "unit", "item", "value", "description", "keywords"]:
+        if col not in df.columns:
+            df[col] = ""
 
-    # 基本清理：轉成字串，避免 NaN
-    for col in ["category", "year", "unit", "item", "description"]:
-        if col in df.columns:
-            df[col] = df[col].astype(str).fillna("")
+    # 轉字串、去空白
+    for col in ["category", "unit", "item", "description", "keywords"]:
+        df[col] = df[col].astype(str).str.strip()
 
-    # 數值欄位
-    if "value" in df.columns:
-        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    # 年度與數值
+    df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
 
-    _KNOWLEDGE = df
-    print(f"[DEBUG] Knowledge loaded. Rows={len(df)}")
+    # series_key：同一指標不同年度，共用同一 key（跨年度比較用）
+    if "series_key" not in df.columns:
+        df["series_key"] = df["category"] + "|" + df["unit"] + "|" + df["item"]
+    else:
+        df["series_key"] = df["series_key"].astype(str).str.strip()
+
+    # search_text：模糊比對使用
+    if "search_text" not in df.columns:
+        def make_search_text(row):
+            parts = []
+            cat = row.get("category")
+            if pd.notna(cat):
+                parts.append(str(cat))
+
+            year = row.get("year")
+            if pd.notna(year):
+                y = int(year)
+                parts.append(f"{y}年")
+                parts.append(f"{y}年度")
+
+            unit = row.get("unit")
+            if pd.notna(unit):
+                parts.append(str(unit))
+
+            item = row.get("item")
+            if pd.notna(item):
+                parts.append(str(item))
+
+            kw = row.get("keywords")
+            if pd.notna(kw) and str(kw).strip():
+                parts.append(str(kw))
+
+            return " ".join(parts)
+
+        df["search_text"] = df.apply(make_search_text, axis=1)
+    else:
+        df["search_text"] = df["search_text"].astype(str)
+
+    df = df.fillna("")
     return df
 
 
-# ------------------------------------------------------------
-# 共用工具
-# ------------------------------------------------------------
+_KNOWLEDGE = _load_knowledge()
+
+
+# === 工具函式 ===
 
 def _extract_years(text: str):
-    """從問題字串抓出所有出現的年度（例如 113、112）。"""
-    years = []
-    for m in re.finditer(r"(\d{2,3})年", text):
-        y = m.group(1)
-        if y not in years:
-            years.append(y)
-    return years
+    """從問題中抓出所有『XXX年』的數字（例如 113、112）。"""
+    return [int(m) for m in re.findall(r"(\d{2,3})年", text)]
 
 
-def _fuzzy_match(query: str, choices) -> Tuple[Optional[str], float]:
-    """
-    使用 difflib 做最單純的模糊比對。
-    回傳 (最佳文字, 分數 0–100)
-    """
-    if not choices:
-        return None, 0.0
+def _similarity(a: str, b: str) -> float:
+    """字串相似度（0~100）。"""
+    return difflib.SequenceMatcher(None, a, b).ratio() * 100.0
 
+
+def _fuzzy_best_match(query: str, choices) -> Tuple[Optional[str], float]:
+    """在 choices 中找出與 query 最相近的那一個。"""
     best = None
     best_score = 0.0
     for c in choices:
         c_str = str(c)
-        score = difflib.SequenceMatcher(None, query, c_str).ratio() * 100
+        score = _similarity(query, c_str)
         if score > best_score:
-            best = c_str
             best_score = score
+            best = c_str
     return best, best_score
 
 
-def _format_number(v) -> str:
-    try:
-        return f"{float(v):,.0f}"
-    except Exception:
-        return str(v)
+def _is_compare_question(text: str) -> bool:
+    """判斷是否為『跨年度比較／變動』的問題。"""
+    keywords = [
+        "比較", "差異", "變動", "增減", "成長率", "成長",
+        "較上一年", "較上一年度", "較前一年", "較去年",
+    ]
+    return any(k in text for k in keywords)
 
 
-# ------------------------------------------------------------
-# 以 year / unit / item 直接查詢
-# ------------------------------------------------------------
-
-def lookup_by_key(year: str, unit: str, item: str) -> Optional[Dict]:
-    df = _load_knowledge()
-    mask = (
-        (df["year"].astype(str) == str(year).strip()) &
-        (df["unit"].astype(str) == str(unit).strip()) &
-        (df["item"].astype(str) == str(item).strip())
-    )
-    rows = df[mask]
-    if rows.empty:
-        return None
-    return rows.iloc[0].to_dict()
-
-
-# ------------------------------------------------------------
-# 一般問題：單年度查詢
-# ------------------------------------------------------------
-
-_MIN_UNIT_SCORE = 60.0
-_MIN_ITEM_SCORE = 60.0
-_MIN_KEY_SCORE = 70.0  # year+unit+item 三者都要蠻接近時才回應（目前沒直接用到）
-
-def _find_best_single_row(text: str) -> Optional[Dict]:
+def _parse_compare_years(text: str) -> Optional[Tuple[int, int]]:
     """
-    解析像「113年工務局職員總數」這種問題。
-    只處理「單一年度」的查詢。
+    解析比較問題中的新舊年度：
+    回傳 (new_year, old_year)，例如 (113, 112)
     """
-    df = _load_knowledge()
-
     years = _extract_years(text)
+    if len(years) >= 2:
+        # 問句同時出現兩個年份，例如「113年跟112年比較」
+        years_sorted = sorted(years)
+        old_year = years_sorted[0]
+        new_year = years_sorted[-1]
+        return new_year, old_year
+
+    if len(years) == 1:
+        year = years[0]
+        # 有提到『上一年／上一年度／前一年／去年』之類，就當成 year 跟 year-1 比較
+        if any(w in text for w in ["較上一年", "較上一年度", "上一年度", "上一年", "前一年", "去年"]):
+            return year, year - 1
+
+    return None
+
+
+def _find_row_single_year(question: str) -> Optional[Dict]:
+    """處理單一年度查詢：例如『113年工務局職員人數』。"""
+    if _KNOWLEDGE.empty:
+        return None
+
+    years = _extract_years(question)
     if not years:
         return None
-    year = years[0]
 
-    # 先過濾指定年度
-    df_y = df[df["year"].astype(str) == year]
-    if df_y.empty:
+    year = max(years)  # 若有多個，選最新的那個
+    df_year = _KNOWLEDGE[_KNOWLEDGE["year"] == year]
+    if df_year.empty:
         return None
 
-    # 找 unit
-    unit_choices = df_y["unit"].unique().tolist()
-    best_unit, unit_score = _fuzzy_match(text, unit_choices)
-    if not best_unit or unit_score < _MIN_UNIT_SCORE:
+    # 先模糊比對 unit
+    unit_choices = df_year["unit"].unique()
+    best_unit, unit_score = _fuzzy_best_match(question, unit_choices)
+
+    # 再模糊比對 item
+    item_choices = df_year["item"].unique()
+    best_item, item_score = _fuzzy_best_match(question, item_choices)
+
+    # 分數太低就當作找不到，直接走預設回覆
+    if unit_score < MIN_UNIT_SCORE or item_score < MIN_ITEM_SCORE:
         return None
 
-    df_yu = df_y[df_y["unit"] == best_unit]
-
-    # 找 item
-    item_choices = df_yu["item"].unique().tolist()
-    best_item, item_score = _fuzzy_match(text, item_choices)
-    if not best_item or item_score < _MIN_ITEM_SCORE:
+    df_match = df_year[(df_year["unit"] == best_unit) & (df_year["item"] == best_item)]
+    if df_match.empty:
         return None
 
-    df_final = df_yu[df_yu["item"] == best_item]
-    if df_final.empty:
-        return None
-
-    row = df_final.iloc[0].to_dict()
-    row["year"] = year
+    # 正常情況只會有一筆；多筆就取第一筆
+    row = df_match.iloc[0].to_dict()
     return row
 
 
-# ------------------------------------------------------------
-# 年度比較：113 年與 112 年比較、或「113 年較上一年變動」
-# ------------------------------------------------------------
-
-def _build_year_comparison_answer(text: str) -> Optional[str]:
-    """
-    偵測「比較、變動、差異」相關的問題，回傳比較用文字。
-    例如：
-      - 113年工務局主管預算數跟112年比較
-      - 113年工務局主管預算數較上一年變動
-    """
-    if not re.search(r"(比較|變動|差異)", text):
-        return None
-
-    df = _load_knowledge()
-
-    years = _extract_years(text)
-    if not years:
-        return None
-
-    # 取得要比較的兩個年度：
-    # case1：題目中寫兩個年度 -> 用那兩個
-    # case2：只有一個年度，且有「上一年／前一年／去年」等字樣 -> 用 (該年, 該年-1)
-    if len(years) >= 2:
-        y1, y2 = years[0], years[1]
-    else:
-        y1 = years[0]
-        if re.search(r"(上一年|上年度|前一年|前年度|去年)", text):
-            try:
-                y2 = str(int(y1) - 1)
-            except Exception:
-                return None
-        else:
-            # 只有一個年度又看不出是跟哪一年比，就放棄
-            return None
-
-    # 只留下這兩年資料
-    df_2y = df[df["year"].astype(str).isin([y1, y2])]
-    if df_2y["year"].nunique() < 2:
-        return None
-
-    # 找 unit
-    unit_choices = df_2y["unit"].unique().tolist()
-    best_unit, unit_score = _fuzzy_match(text, unit_choices)
-    if not best_unit or unit_score < _MIN_UNIT_SCORE:
-        return None
-
-    df_u = df_2y[df_2y["unit"] == best_unit]
-
-    # 找 item
-    item_choices = df_u["item"].unique().tolist()
-    best_item, item_score = _fuzzy_match(text, item_choices)
-    if not best_item or item_score < _MIN_ITEM_SCORE:
-        return None
-
-    df_ui = df_u[df_u["item"] == best_item]
-    if df_ui["year"].nunique() < 2:
-        return None
-
-    # new / old 年：以數字大小判斷
-    y1_int, y2_int = int(y1), int(y2)
-    new_year = str(max(y1_int, y2_int))
-    old_year = str(min(y1_int, y2_int))
-
-    row_new = df_ui[df_ui["year"].astype(str) == new_year].iloc[0].to_dict()
-    row_old = df_ui[df_ui["year"].astype(str) == old_year].iloc[0].to_dict()
-
-    v_new = row_new.get("value")
-    v_old = row_old.get("value")
-    if v_new is None or v_old is None:
-        return None
-
-    try:
-        diff = float(v_new) - float(v_old)
-        rate = (diff / float(v_old)) * 100 if float(v_old) != 0 else 0.0
-    except Exception:
-        return None
-
-    category = row_new.get("category", "")
-    unit = best_unit
-    item = best_item
-
-    desc_old = str(row_old.get("description", "")).strip()
-    desc_new = str(row_new.get("description", "")).strip()
-
-    lines = []
-    if category:
-        lines.append(f"【類別】{category}")
-    lines.append(f"【比較項目】{unit}/{item}")
-    lines.append(f"【{old_year} 年數值】{_format_number(v_old)}")
-    lines.append(f"【{new_year} 年數值】{_format_number(v_new)}")
-    lines.append(f"【差額】{_format_number(diff)}")
-    lines.append(f"【成長率】{rate:.2f}%（以 {old_year} 年為基準）")
-
-    if desc_old:
-        lines.append("")
-        lines.append(f"{old_year} 年說明：{desc_old}")
-    if desc_new:
-        lines.append(f"{new_year} 年說明：{desc_new}")
-
-    return "\n".join(lines)
-
-
-# ------------------------------------------------------------
-# 回覆格式（單一年度）
-# ------------------------------------------------------------
-
-def _format_row(row: Dict) -> str:
+def _build_single_answer(row: Dict) -> str:
+    """把單筆資料整理成回覆文字。"""
     parts = []
     if row.get("category"):
         parts.append(f"【類別】{row['category']}")
-    if row.get("year"):
+    if row.get("year") not in ("", None, pd.NA):
         parts.append(f"【年度】{row['year']} 年")
     if row.get("unit"):
         parts.append(f"【單位】{row['unit']}")
     if row.get("item"):
         parts.append(f"【項目】{row['item']}")
-    if row.get("value") is not None:
-        parts.append(f"【數值】{_format_number(row['value'])}")
+    if row.get("value") not in ("", None, pd.NA):
+        parts.append(f"【數值】{row['value']}")
     if row.get("description"):
         parts.append(str(row["description"]))
     return "\n".join(parts)
 
 
-# ------------------------------------------------------------
-# 對外主入口：build_reply
-# ------------------------------------------------------------
+def _build_compare_answer(question: str) -> Optional[str]:
+    """
+    處理『跨年度比較／較上一年度變動』的問題。
+    例如：
+    - 113年工務局主管預算數較上一年度變動
+    - 113年工務局主管預算數跟112年比較
+    """
+    if _KNOWLEDGE.empty:
+        return None
+
+    year_pair = _parse_compare_years(question)
+    if not year_pair:
+        return None
+
+    new_year, old_year = year_pair
+
+    df_new = _KNOWLEDGE[_KNOWLEDGE["year"] == new_year]
+    if df_new.empty:
+        return None
+
+    # 把比較相關字眼拿掉，避免干擾比對
+    cleaned_q = question
+    for token in [
+        "較上一年", "較上一年度", "上一年度", "上一年", "前一年", "去年",
+        "比較", "變動", "差異", "增減", "成長率", "成長",
+    ]:
+        cleaned_q = cleaned_q.replace(token, "")
+
+    # 用 search_text 做一輪模糊比對，找出最接近的那一筆指標
+    best_idx = None
+    best_score = 0.0
+    for idx, row in df_new.iterrows():
+        score = _similarity(cleaned_q, str(row.get("search_text", "")))
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+
+    if best_idx is None or best_score < MIN_COMPARE_SEARCH_SCORE:
+        # 分數太低，代表問句太模糊或跟資料無關
+        return None
+
+    row_new = df_new.loc[best_idx]
+
+    # 用 series_key + 年度 找上一年度
+    series_key = row_new.get("series_key")
+    df_old_match = _KNOWLEDGE[
+        (_KNOWLEDGE["year"] == old_year) &
+        (_KNOWLEDGE["series_key"] == series_key)
+    ]
+
+    if df_old_match.empty:
+        # 找不到上一年度的對應資料，就當作無法比較
+        return None
+
+    row_old = df_old_match.iloc[0]
+
+    v_new = row_new.get("value")
+    v_old = row_old.get("value")
+
+    if pd.isna(v_new) or pd.isna(v_old):
+        return None
+
+    diff = float(v_new) - float(v_old)
+    if float(v_old) != 0:
+        growth_rate = diff / float(v_old) * 100.0
+        growth_text = f"{growth_rate:.2f}%"
+    else:
+        growth_text = "（上一年度為 0，無法計算成長率）"
+
+    # 組合回覆
+    unit = row_new.get("unit", "")
+    item = row_new.get("item", "")
+    cat = row_new.get("category", "")
+
+    lines = []
+    title = f"{cat}－{unit}{item}（{new_year} 年 vs. {old_year} 年）"
+    lines.append(title)
+
+    lines.append(f"【{old_year} 年數值】{v_old}")
+    lines.append(f"【{new_year} 年數值】{v_new}")
+    lines.append(f"【差額】{diff}")
+    lines.append(f"【成長率】{growth_text}")
+
+    # 如有說明文字，可附上最新年度的描述
+    desc_new = str(row_new.get("description") or "").strip()
+    if desc_new:
+        lines.append("")
+        lines.append("【最新年度說明】")
+        lines.append(desc_new)
+
+    return "\n".join(lines)
+
 
 def build_reply(question: str) -> str:
-    """依照使用者提問，自動決定要回單年查詢或年度比較。"""
-    text = (question or "").strip()
-    if not text:
-        return "抱歉，我不太確定你的問題，可以再補充一下嗎？"
+    """
+    LINE Bot 對外使用的主函式。
+    傳入使用者文字，回傳要顯示的回覆內容。
+    """
+    q = (question or "").strip()
 
-    # --------------------------------------------------------
-    # 1) 管理者查詢模式：#113,工務局,職員總數
-    # --------------------------------------------------------
-    if text.startswith("#"):
-        payload = text[1:].strip()  # 去掉 #
-        parts = [p.strip() for p in re.split("[,，]", payload) if p.strip()]
-        if len(parts) != 3:
-            return (
-                "【查詢格式錯誤】\n"
-                "請使用：#年度,單位,項目\n"
-                "例如：#113,工務局,職員總數"
-            )
-        year, unit, item = parts
-        row = lookup_by_key(year, unit, item)
-        if row is None:
-            return "抱歉，查無對應資料，請確認年度、單位及項目是否正確。"
-        return _format_row(row)
+    if not q:
+        return "可以輸入想查詢的年度、單位與項目，例如：113年工務局職員人數。"
 
-    # --------------------------------------------------------
-    # 2) 年度比較問題：先嘗試建構比較答案
-    # --------------------------------------------------------
-    cmp_answer = _build_year_comparison_answer(text)
-    if cmp_answer:
-        return cmp_answer
+    # 後門查詢：#year,unit,item  例如：#113,工務局,職員人數
+    if q.startswith("#"):
+        try:
+            _, payload = q.split("#", 1)
+            parts = [p.strip() for p in payload.split(",") if p.strip()]
+            if len(parts) >= 3:
+                year_str, unit, item = parts[0], parts[1], parts[2]
+                year = int(re.sub(r"[^0-9]", "", year_str))
+                df_yr = _KNOWLEDGE[_KNOWLEDGE["year"] == year]
+                df_match = df_yr[(df_yr["unit"] == unit) & (df_yr["item"] == item)]
+                if not df_match.empty:
+                    row = df_match.iloc[0].to_dict()
+                    return _build_single_answer(row)
+                else:
+                    return "找不到符合 year/unit/item 的資料，請確認輸入是否正確。"
+        except Exception:
+            # 如果格式怪怪的，就當作一般問題處理
+            pass
 
-    # --------------------------------------------------------
-    # 3) 一般單年度查詢
-    # --------------------------------------------------------
-    row = _find_best_single_row(text)
-    if row is not None:
-        return _format_row(row)
+    # 先判斷是不是「跨年度比較／變動」問題
+    if _is_compare_question(q):
+        compare_answer = _build_compare_answer(q)
+        if compare_answer:
+            return compare_answer
 
-    # --------------------------------------------------------
-    # 4) 以上都失敗，就回預設句
-    # --------------------------------------------------------
-    return "抱歉，我在訓練資料裡找不到這個問題的答案，可以換個說法或問別的問題喔。"
+    # 一般單年度查詢
+    row = _find_row_single_year(q)
+    if row is None:
+        return "抱歉，我在訓練資料裡找不到這個問題的答案，可以換個說法或問別的問題喔。"
+
+    return _build_single_answer(row)
