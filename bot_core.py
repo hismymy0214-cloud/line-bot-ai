@@ -1,4 +1,3 @@
-# bot_core.py
 import os
 import re
 import difflib
@@ -189,14 +188,25 @@ def _build_single_answer(row: Dict) -> str:
     parts = []
     if row.get("category"):
         parts.append(f"【類別】{row['category']}")
-    if row.get("year") not in ("", None, pd.NA):
-        parts.append(f"【年度】{row['year']} 年")
+
+    # 年度要用 pd.isna 判斷，不能拿 pd.NA 去做 in / ==
+    year_val = row.get("year")
+    if not pd.isna(year_val) and str(year_val) != "":
+        try:
+            y_int = int(year_val)
+            parts.append(f"【年度】{y_int} 年")
+        except Exception:
+            parts.append(f"【年度】{year_val} 年")
+
     if row.get("unit"):
         parts.append(f"【單位】{row['unit']}")
     if row.get("item"):
         parts.append(f"【項目】{row['item']}")
-    if row.get("value") not in ("", None, pd.NA):
-        parts.append(f"【數值】{row['value']}")
+
+    val = row.get("value")
+    if not pd.isna(val) and str(val) != "":
+        parts.append(f"【數值】{val}")
+
     if row.get("description"):
         parts.append(str(row["description"]))
     return "\n".join(parts)
