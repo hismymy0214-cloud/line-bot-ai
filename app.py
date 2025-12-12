@@ -1,37 +1,33 @@
+# -*- coding: utf-8 -*-
 import os
 
 from flask import Flask, request, abort
+
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
-# 強制確保載入 bot_core，讓 _load_knowledge() 一定執行
-import bot_core
 from bot_core import build_reply
 
 app = Flask(__name__)
 
-# 從環境變數讀取 LINE Bot 的金鑰
-CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
-CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 
-if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
-    raise RuntimeError(
-        "請先在環境變數 LINE_CHANNEL_ACCESS_TOKEN 與 LINE_CHANNEL_SECRET 設定你的 LINE Bot 金鑰。"
-    )
+if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
+    print("[WARN] Missing LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET env vars.")
 
-line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(CHANNEL_SECRET)
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 
 @app.route("/", methods=["GET"])
-def index():
-    return "LINE bot is running."
+def health():
+    return "OK", 200
 
 
 @app.route("/callback", methods=["POST"])
 def callback():
-    # LINE 簽章
     signature = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
 
@@ -40,12 +36,12 @@ def callback():
     except InvalidSignatureError:
         abort(400)
 
-    return "OK"
+    return "OK", 200
 
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event: MessageEvent):
-    user_text = event.message.text.strip()
+    user_text = (event.message.text or "").strip()
     reply_text = build_reply(user_text)
 
     line_bot_api.reply_message(
@@ -55,6 +51,5 @@ def handle_message(event: MessageEvent):
 
 
 if __name__ == "__main__":
-    # 本機測試用；在 Render 上會用 gunicorn 啟動，不會走到這裡
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
