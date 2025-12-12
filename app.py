@@ -1,6 +1,4 @@
-# -*- coding: utf-8 -*-
 import os
-
 from flask import Flask, request, abort
 
 from linebot import LineBotApi, WebhookHandler
@@ -11,18 +9,19 @@ from bot_core import build_reply
 
 app = Flask(__name__)
 
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 
 if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
-    print("[WARN] Missing LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET env vars.")
+    # 在 Render 看 logs 會比較好查
+    print("[WARN] LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET is not set.")
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 
 @app.route("/", methods=["GET"])
-def health():
+def home():
     return "OK", 200
 
 
@@ -40,7 +39,7 @@ def callback():
 
 
 @handler.add(MessageEvent, message=TextMessage)
-def handle_message(event: MessageEvent):
+def handle_message(event):
     user_text = (event.message.text or "").strip()
     reply_text = build_reply(user_text)
 
@@ -51,5 +50,6 @@ def handle_message(event: MessageEvent):
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
+    # 本機測試用；Render 會用 gunicorn 啟動
+    port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)

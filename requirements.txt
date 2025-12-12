@@ -1,6 +1,5 @@
 flask
 line-bot-sdk
-openpyxl
 pandas
+openpyxl
 gunicorn
-rapidfuzz
