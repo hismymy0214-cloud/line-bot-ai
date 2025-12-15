@@ -340,7 +340,7 @@ def _format_multiyear_reply(base_topic: str, years: List[int], year_to_text: Dic
         miss = "、".join([f"{m}年" for m in sorted(missing, reverse=True)])
         body = f"{body}\n\n（查無資料年度：{miss}）"
 
-    return f"{header}\n\n{body}"
+    return body
 
 
 def build_reply(user_text: str) -> str:
