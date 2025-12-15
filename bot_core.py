@@ -321,9 +321,6 @@ def _format_multiyear_reply(base_topic: str, years: List[int], year_to_text: Dic
     if not years:
         return DEFAULT_REPLY
 
-    y1, y2 = years[0], years[-1]
-    topic = base_topic.strip() or "查詢結果"
-
     blocks: List[str] = []
     missing: List[int] = []
 
@@ -333,7 +330,7 @@ def _format_multiyear_reply(base_topic: str, years: List[int], year_to_text: Dic
             missing.append(y)
             continue
         blocks.append(f"【{y}年】\n{ans}")
-    
+
     body = "\n\n".join(blocks) if blocks else "（本次範圍內皆查無符合資料）"
 
     if missing:
