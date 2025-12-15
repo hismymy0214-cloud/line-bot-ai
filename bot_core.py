@@ -333,8 +333,7 @@ def _format_multiyear_reply(base_topic: str, years: List[int], year_to_text: Dic
             missing.append(y)
             continue
         blocks.append(f"【{y}年】\n{ans}")
-
-    header = f"【多年度查詢】{topic}（{y1}–{y2}年）"
+    
     body = "\n\n".join(blocks) if blocks else "（本次範圍內皆查無符合資料）"
 
     if missing:
