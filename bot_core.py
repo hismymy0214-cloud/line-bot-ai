@@ -18,8 +18,9 @@ DATA_PATH = os.path.join(BASE_DIR, DATA_FILE)
 # 覆蓋率門檻：keywords 至少 80% 被使用者輸入「涵蓋」才算命中
 COVERAGE_THRESHOLD = float(os.environ.get("COVERAGE_THRESHOLD", "0.8"))
 
-# 接近門檻：>= 0.6 且 < 0.8 時，回「最接近 1 筆」提示
+# 接近門檻：>= 0.6 且 < 0.8 時，回候選提示
 SUGGEST_THRESHOLD = float(os.environ.get("SUGGEST_THRESHOLD", "0.6"))
+SUGGEST_TOPN = int(os.environ.get("SUGGEST_TOPN", "3"))
 
 # 輸入太短時先引導
 MIN_QUERY_LEN = int(os.environ.get("MIN_QUERY_LEN", "8"))
@@ -222,14 +223,16 @@ def build_reply(user_text: str) -> str:
                     "請在問題前面加上年度（例如：113年）再查詢一次。"
                 )
 
-    # B) 關鍵詞不夠完整：只給最接近 1 筆、改成較自然的提示語
+    # B) 關鍵詞不夠完整：列出最接近 3 筆（不顯示相符率）
     if ranked:
-        best_r, _, best_e = ranked[0]
+        best_r, _, _ = ranked[0]
         if best_r >= SUGGEST_THRESHOLD:
+            picks = ranked[:SUGGEST_TOPN]
+            lines = "\n".join([f"- {e.keyword}" for _, _, e in picks])
             return (
-                "您是不是要找：\n"
-                f"- {best_e.keyword}\n"
-                "（若不是，請再補充更完整的關鍵詞，例如：單位＋項目＋職等/門別等）"
+                "您是不是要找下列資料：\n"
+                f"{lines}\n"
+                "（若都不是，請再補充更完整的關鍵詞，例如：年度＋單位＋項目＋職等/門別）"
             )
 
     return DEFAULT_REPLY
