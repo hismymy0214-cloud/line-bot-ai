@@ -18,11 +18,10 @@ DATA_PATH = os.path.join(BASE_DIR, DATA_FILE)
 # 覆蓋率門檻：keywords 至少 80% 被使用者輸入「涵蓋」才算命中
 COVERAGE_THRESHOLD = float(os.environ.get("COVERAGE_THRESHOLD", "0.8"))
 
-# 候選建議區間：60%～80% 會列出最接近的 keywords
+# 接近門檻：>= 0.6 且 < 0.8 時，回「最接近 1 筆」提示
 SUGGEST_THRESHOLD = float(os.environ.get("SUGGEST_THRESHOLD", "0.6"))
-SUGGEST_TOPN = int(os.environ.get("SUGGEST_TOPN", "3"))
 
-# 輸入太短時（像「113年工務局主管」）先引導
+# 輸入太短時先引導
 MIN_QUERY_LEN = int(os.environ.get("MIN_QUERY_LEN", "8"))
 
 # 額外：常見同義/寫法修正（可再擴充）
@@ -37,7 +36,6 @@ _YEAR_RE = re.compile(r"(?P<y>\d{3})\s*年")
 
 
 def _normalize(text: str) -> str:
-    """把輸入字串做標準化，提升命中率（不做斷詞，只做輕量規範）。"""
     if text is None:
         return ""
     t = str(text).strip()
@@ -48,25 +46,15 @@ def _normalize(text: str) -> str:
 
 
 def _extract_year(text: str) -> Optional[str]:
-    """
-    從文字抓年度（3位數：111/112/113...），回傳 '113'。
-    若未出現則回傳 None。
-    """
     m = _YEAR_RE.search(text)
     if m:
         return m.group("y")
-    # 有些人只打 113 也可能想查
     m2 = re.search(r"(?P<y>\d{3})", text)
     return m2.group("y") if m2 else None
 
 
 def _strip_year(text_norm: str) -> str:
-    """
-    移除正規化後的年度標記（例如 113年 / 113），用於「未輸入年度」時的輔助比對。
-    """
-    # 先移除 113年 形式
     t = _YEAR_RE.sub("", text_norm)
-    # 再移除單獨的三位數（避免殘留）
     t = re.sub(r"\d{3}", "", t)
     return t
 
@@ -85,7 +73,6 @@ _ENTRIES: List[Entry] = []
 
 
 def _load_training() -> None:
-    """讀取 training.xlsx，只使用：keywords / description。"""
     global _EXACT_MAP, _ENTRIES
 
     if not os.path.exists(DATA_PATH):
@@ -140,7 +127,6 @@ _load_training()
 
 
 def _match_by_exact(user_text: str) -> Optional[str]:
-    """keywords 完全符合（含基本正規化後）就直接回傳 description。"""
     key = _normalize(user_text)
     if not key:
         return None
@@ -148,10 +134,6 @@ def _match_by_exact(user_text: str) -> Optional[str]:
 
 
 def _coverage_ratio(keyword_norm: str, user_norm: str) -> float:
-    """
-    覆蓋率：keywords 裡的字元，有多少也出現在 user。
-    用 Counter 可以處理重複字。
-    """
     if not keyword_norm:
         return 0.0
     kw = Counter(keyword_norm)
@@ -161,9 +143,6 @@ def _coverage_ratio(keyword_norm: str, user_norm: str) -> float:
 
 
 def _rank_matches(user_text: str, use_year_filter: bool = True) -> List[Tuple[float, int, Entry]]:
-    """
-    回傳依覆蓋率排序的候選清單 [(ratio, tie_len, entry), ...]
-    """
     user_norm = _normalize(user_text)
     if not user_norm:
         return []
@@ -177,7 +156,7 @@ def _rank_matches(user_text: str, use_year_filter: bool = True) -> List[Tuple[fl
     ranked: List[Tuple[float, int, Entry]] = []
     for e in candidates:
         r = _coverage_ratio(e.keyword_norm, user_norm)
-        tie = len(e.keyword_norm)  # 同分偏好較長（更具體）
+        tie = len(e.keyword_norm)
         ranked.append((r, tie, e))
 
     ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
@@ -185,9 +164,6 @@ def _rank_matches(user_text: str, use_year_filter: bool = True) -> List[Tuple[fl
 
 
 def _rank_matches_noyear(user_text: str) -> List[Tuple[float, int, Entry]]:
-    """
-    未輸入年度時：用「去年度」版本做輔助比對。
-    """
     user_norm = _normalize(user_text)
     if not user_norm:
         return []
@@ -198,7 +174,6 @@ def _rank_matches_noyear(user_text: str) -> List[Tuple[float, int, Entry]]:
 
     ranked: List[Tuple[float, int, Entry]] = []
     for e in _ENTRIES:
-        # 以「去年度」字串算覆蓋率
         r = _coverage_ratio(e.keyword_norm_noyear, user_norm_noyear)
         tie = len(e.keyword_norm_noyear)
         ranked.append((r, tie, e))
@@ -207,21 +182,7 @@ def _rank_matches_noyear(user_text: str) -> List[Tuple[float, int, Entry]]:
     return ranked
 
 
-def _format_suggestions(items: List[Tuple[float, int, Entry]], topn: int) -> str:
-    picks = items[:topn]
-    lines = []
-    for r, _, e in picks:
-        pct = int(round(r * 100))
-        lines.append(f"- {e.keyword}（相符約 {pct}%）")
-    return "\n".join(lines)
-
-
 def build_reply(user_text: str) -> str:
-    """
-    A) 輸入太短 -> 引導（給範例）
-    B) 60%~80% -> 列出最接近 keywords 清單供複製
-    C) 未輸入年度但很像某些題 -> 先詢問年度並列候選
-    """
     text = (user_text or "").strip()
     if not text:
         return DEFAULT_REPLY
@@ -229,7 +190,7 @@ def build_reply(user_text: str) -> str:
     user_norm = _normalize(text)
     user_year = _extract_year(text)
 
-    # A) 太短先引導（避免亂猜）
+    # A) 太短先引導
     if len(user_norm) < MIN_QUERY_LEN:
         return (
             "請輸入更完整的查詢關鍵詞（含年度/單位/指標），例如：\n"
@@ -250,30 +211,25 @@ def build_reply(user_text: str) -> str:
         if best_r >= COVERAGE_THRESHOLD:
             return best_e.description
 
-    # C) 沒輸入年度：用去年度比對判斷是否應該先問年度
+    # C) 少打年度：只提醒補年度（不列候選）
     if not user_year:
         ranked_noyear = _rank_matches_noyear(text)
         if ranked_noyear:
             best_r2, _, _ = ranked_noyear[0]
-            # 如果「去年度」比對已經很高，代表多半只是漏打年度
             if best_r2 >= COVERAGE_THRESHOLD:
-                # 列出不同年度的候選（最多 3）
-                suggestions = _format_suggestions(ranked_noyear, SUGGEST_TOPN)
                 return (
-                    "我看起來你可能少打了『年度』。\n"
-                    "請補上年度（例如：113年），或直接複製下列其中一筆再送出：\n"
-                    f"{suggestions}"
+                    "看起來您可能少輸入「年度」。\n"
+                    "請在問題前面加上年度（例如：113年）再查詢一次。"
                 )
 
-    # B) 60%~80%：給候選清單（帶年度過濾後）
+    # B) 關鍵詞不夠完整：只給最接近 1 筆、改成較自然的提示語
     if ranked:
-        best_r, _, _ = ranked[0]
+        best_r, _, best_e = ranked[0]
         if best_r >= SUGGEST_THRESHOLD:
-            suggestions = _format_suggestions(ranked, SUGGEST_TOPN)
             return (
-                "我找到了接近的查詢項目，但關鍵詞還不夠完整。\n"
-                "請直接複製下列其中一筆 keywords 再送出：\n"
-                f"{suggestions}"
+                "您是不是要找：\n"
+                f"- {best_e.keyword}\n"
+                "（若不是，請再補充更完整的關鍵詞，例如：單位＋項目＋職等/門別等）"
             )
 
     return DEFAULT_REPLY
