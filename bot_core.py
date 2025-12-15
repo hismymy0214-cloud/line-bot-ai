@@ -25,6 +25,9 @@ SUGGEST_TOPN = int(os.environ.get("SUGGEST_TOPN", "3"))
 # 輸入太短時先引導
 MIN_QUERY_LEN = int(os.environ.get("MIN_QUERY_LEN", "8"))
 
+# 來源文字（你想顯示的固定字樣）
+SOURCE_TITLE = os.environ.get("SOURCE_TITLE", "高雄市政府工務局113年度性別統計年報")
+
 # 額外：常見同義/寫法修正（可再擴充）
 _REPLACEMENTS = [
     ("年度", "年"),
@@ -67,10 +70,21 @@ class Entry:
     keyword_norm_noyear: str
     year: Optional[str]
     description: str
+    source_url: str
 
 
-_EXACT_MAP: Dict[str, str] = {}
+_EXACT_MAP: Dict[str, Entry] = {}
 _ENTRIES: List[Entry] = []
+
+
+def _format_answer(entry: Entry) -> str:
+    """
+    LINE 不支援 markdown hyperlink，但會把純網址自動轉成可點連結，
+    所以用「來源文字 + 換行 + URL」最穩。
+    """
+    if entry.source_url:
+        return f"{entry.description}\n來源：{SOURCE_TITLE}\n{entry.source_url}"
+    return entry.description
 
 
 def _load_training() -> None:
@@ -86,7 +100,7 @@ def _load_training() -> None:
     cols = [c.strip().lower() for c in df.columns]
     colmap = {c.strip().lower(): c for c in df.columns}
 
-    required = ["keywords", "description"]
+    required = ["keywords", "description", "source_url"]
     missing = [c for c in required if c not in cols]
     if missing:
         print(f"[ERROR] training file missing columns: {missing}. Found: {list(df.columns)}")
@@ -96,13 +110,16 @@ def _load_training() -> None:
 
     kw_col = colmap["keywords"]
     desc_col = colmap["description"]
+    src_col = colmap["source_url"]
 
-    exact_map: Dict[str, str] = {}
+    exact_map: Dict[str, Entry] = {}
     entries: List[Entry] = []
 
     for _, r in df.iterrows():
         kw_raw = str(r.get(kw_col, "")).strip()
         desc = str(r.get(desc_col, "")).strip()
+        src = str(r.get(src_col, "")).strip()
+
         if not kw_raw or not desc:
             continue
 
@@ -110,14 +127,17 @@ def _load_training() -> None:
         y = _extract_year(kw_raw)
         kw_norm_noyear = _strip_year(kw_norm)
 
-        exact_map[kw_norm] = desc
-        entries.append(Entry(
+        e = Entry(
             keyword=kw_raw,
             keyword_norm=kw_norm,
             keyword_norm_noyear=kw_norm_noyear,
             year=y,
-            description=desc
-        ))
+            description=desc,
+            source_url=src
+        )
+
+        exact_map[kw_norm] = e
+        entries.append(e)
 
     _EXACT_MAP = exact_map
     _ENTRIES = entries
@@ -127,7 +147,7 @@ def _load_training() -> None:
 _load_training()
 
 
-def _match_by_exact(user_text: str) -> Optional[str]:
+def _match_by_exact(user_text: str) -> Optional[Entry]:
     key = _normalize(user_text)
     if not key:
         return None
@@ -201,16 +221,16 @@ def build_reply(user_text: str) -> str:
         )
 
     # 1) 完全符合
-    ans = _match_by_exact(text)
-    if ans:
-        return ans
+    e_exact = _match_by_exact(text)
+    if e_exact:
+        return _format_answer(e_exact)
 
     # 2) 年度一致下的覆蓋率比對
     ranked = _rank_matches(text, use_year_filter=True)
     if ranked:
         best_r, _, best_e = ranked[0]
         if best_r >= COVERAGE_THRESHOLD:
-            return best_e.description
+            return _format_answer(best_e)
 
     # C) 少打年度：只提醒補年度（不列候選）
     if not user_year:
