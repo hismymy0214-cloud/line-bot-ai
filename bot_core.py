@@ -22,11 +22,11 @@ COVERAGE_THRESHOLD = float(os.environ.get("COVERAGE_THRESHOLD", "0.8"))
 SUGGEST_THRESHOLD = float(os.environ.get("SUGGEST_THRESHOLD", "0.6"))
 SUGGEST_TOPN = int(os.environ.get("SUGGEST_TOPN", "3"))
 
+# 多年度最多允許查詢多少年（避免有人輸入 80-120 年把 Bot 打爆）
+MAX_YEAR_SPAN = int(os.environ.get("MAX_YEAR_SPAN", "10"))
+
 # 輸入太短時先引導
 MIN_QUERY_LEN = int(os.environ.get("MIN_QUERY_LEN", "8"))
-
-# 來源文字（你想顯示的固定字樣）
-SOURCE_TITLE = os.environ.get("SOURCE_TITLE", "高雄市政府工務局113年度性別統計年報")
 
 # 額外：常見同義/寫法修正（可再擴充）
 _REPLACEMENTS = [
@@ -50,6 +50,7 @@ def _normalize(text: str) -> str:
 
 
 def _extract_year(text: str) -> Optional[str]:
+    """抓第一個年度（113年 / 113）"""
     m = _YEAR_RE.search(text)
     if m:
         return m.group("y")
@@ -61,6 +62,58 @@ def _strip_year(text_norm: str) -> str:
     t = _YEAR_RE.sub("", text_norm)
     t = re.sub(r"\d{3}", "", t)
     return t
+
+
+def extract_years(text: str) -> List[int]:
+    """
+    支援多年度輸入：
+      - 112-113年
+      - 112~113年
+      - 112至113年 / 112到113年
+      - 112,113年 / 112、113年（會取出所有三位數年度）
+    回傳：升冪年份清單，例如 [112, 113]
+    """
+    s = str(text or "")
+
+    # 1) 範圍（含「年」或不含都可）
+    m = re.search(r"(\d{3})\s*[-~－—]\s*(\d{3})\s*年?", s)
+    if not m:
+        m = re.search(r"(\d{3})\s*(?:至|到)\s*(\d{3})\s*年?", s)
+
+    if m:
+        y1, y2 = int(m.group(1)), int(m.group(2))
+        lo, hi = min(y1, y2), max(y1, y2)
+        span = hi - lo + 1
+        if span > MAX_YEAR_SPAN:
+            # 太長就不做多年度（避免被濫用），回空讓後面走單年度提示
+            return []
+        return list(range(lo, hi + 1))
+
+    # 2) 非範圍：抓出所有三位數年度（去重）
+    years = re.findall(r"(\d{3})\s*年?", s)
+    if years:
+        uniq = sorted({int(y) for y in years})
+        return uniq
+
+    return []
+
+
+def strip_year_expression(text: str) -> str:
+    """
+    把文字中的「年度表達」移除，留下「主題」：
+      112-113年工務局暨所屬職員人數 -> 工務局暨所屬職員人數
+    """
+    s = str(text or "")
+
+    # 先去掉範圍
+    s = re.sub(r"\d{3}\s*[-~－—]\s*\d{3}\s*年?", "", s)
+    s = re.sub(r"\d{3}\s*(?:至|到)\s*\d{3}\s*年?", "", s)
+
+    # 再去掉單一年（避免殘留）
+    s = re.sub(r"\d{3}\s*年", "", s)
+    s = re.sub(r"\d{3}", "", s)
+
+    return s.strip()
 
 
 @dataclass(frozen=True)
@@ -80,7 +133,7 @@ _ENTRIES: List[Entry] = []
 def _format_answer(entry: Entry) -> str:
     """
     LINE 不支援 markdown hyperlink，但會把純網址自動轉成可點連結，
-    所以用「來源文字 + 換行 + URL」最穩。
+    所以用「內容 + 換行 + URL」最穩。
     """
     if entry.source_url:
         return f"{entry.description}\n{entry.source_url}"
@@ -203,7 +256,10 @@ def _rank_matches_noyear(user_text: str) -> List[Tuple[float, int, Entry]]:
     return ranked
 
 
-def build_reply(user_text: str) -> str:
+def build_reply_single_year(user_text: str) -> str:
+    """
+    你原本的單年度邏輯（完整保留）。
+    """
     text = (user_text or "").strip()
     if not text:
         return DEFAULT_REPLY
@@ -256,3 +312,59 @@ def build_reply(user_text: str) -> str:
             )
 
     return DEFAULT_REPLY
+
+
+def _format_multiyear_reply(base_topic: str, years: List[int], year_to_text: Dict[int, Optional[str]]) -> str:
+    """
+    多年度格式化：每年一段；缺漏年度集中列示。
+    """
+    if not years:
+        return DEFAULT_REPLY
+
+    y1, y2 = years[0], years[-1]
+    topic = base_topic.strip() or "查詢結果"
+
+    blocks: List[str] = []
+    missing: List[int] = []
+
+    for y in sorted(years, reverse=True):  # 新到舊
+        ans = year_to_text.get(y)
+        if not ans or ans == DEFAULT_REPLY:
+            missing.append(y)
+            continue
+        blocks.append(f"【{y}年】\n{ans}")
+
+    header = f"【多年度查詢】{topic}（{y1}–{y2}年）"
+    body = "\n\n".join(blocks) if blocks else "（本次範圍內皆查無符合資料）"
+
+    if missing:
+        miss = "、".join([f"{m}年" for m in sorted(missing, reverse=True)])
+        body = f"{body}\n\n（查無資料年度：{miss}）"
+
+    return f"{header}\n\n{body}"
+
+
+def build_reply(user_text: str) -> str:
+    """
+    多年度入口：偵測到「年度範圍」就拆成多筆單年度查詢，最後合併回覆。
+    否則走原單年度流程。
+    """
+    text = (user_text or "").strip()
+    if not text:
+        return DEFAULT_REPLY
+
+    years = extract_years(text)
+
+    # 多年度：至少 2 年才進入合併模式
+    if len(years) >= 2:
+        base_topic = strip_year_expression(text)
+        year_to_text: Dict[int, Optional[str]] = {}
+
+        for y in years:
+            q = f"{y}年{base_topic}"
+            year_to_text[y] = build_reply_single_year(q)
+
+        return _format_multiyear_reply(base_topic, years, year_to_text)
+
+    # 單年度：維持原本行為
+    return build_reply_single_year(text)
