@@ -83,7 +83,7 @@ def _format_answer(entry: Entry) -> str:
     所以用「來源文字 + 換行 + URL」最穩。
     """
     if entry.source_url:
-        return f"{entry.description}\n來源：{SOURCE_TITLE}\n{entry.source_url}"
+        return f"{entry.description}\n{entry.source_url}"
     return entry.description
 
 
