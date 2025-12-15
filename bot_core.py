@@ -2,6 +2,7 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+from collections import Counter
 
 import pandas as pd
 
@@ -13,6 +14,9 @@ DEFAULT_REPLY = "抱歉，該訓練檔找不到符合的資料，請重新輸入
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.environ.get("TRAINING_FILE", "training.xlsx")
 DATA_PATH = os.path.join(BASE_DIR, DATA_FILE)
+
+# 覆蓋率門檻：keywords 至少 80% 被使用者輸入「涵蓋」才算命中
+COVERAGE_THRESHOLD = float(os.environ.get("COVERAGE_THRESHOLD", "0.8"))
 
 # 額外：常見同義/寫法修正（可再擴充）
 _REPLACEMENTS = [
@@ -50,11 +54,10 @@ def _extract_year(text: str) -> Optional[str]:
 
 @dataclass(frozen=True)
 class Entry:
-    keyword: str                 # 主 key（唯一）
-    keyword_norm: str            # 正規化後的主 key
-    year: Optional[str]          # 由主 key 推導的年度
-    range_terms: List[str]       # 次 key（關鍵詞列表）
-    description: str             # 要回覆的內容
+    keyword: str
+    keyword_norm: str
+    year: Optional[str]
+    description: str
 
 
 _EXACT_MAP: Dict[str, str] = {}
@@ -62,7 +65,7 @@ _ENTRIES: List[Entry] = []
 
 
 def _load_training() -> None:
-    """讀取 training.xlsx，只使用：keywords / keywords_range / description。"""
+    """讀取 training.xlsx，只使用：keywords / description。"""
     global _EXACT_MAP, _ENTRIES
 
     if not os.path.exists(DATA_PATH):
@@ -75,7 +78,7 @@ def _load_training() -> None:
     cols = [c.strip().lower() for c in df.columns]
     colmap = {c.strip().lower(): c for c in df.columns}
 
-    required = ["keywords", "keywords_range", "description"]
+    required = ["keywords", "description"]
     missing = [c for c in required if c not in cols]
     if missing:
         print(f"[ERROR] training file missing columns: {missing}. Found: {list(df.columns)}")
@@ -84,7 +87,6 @@ def _load_training() -> None:
         return
 
     kw_col = colmap["keywords"]
-    kr_col = colmap["keywords_range"]
     desc_col = colmap["description"]
 
     exact_map: Dict[str, str] = {}
@@ -93,26 +95,10 @@ def _load_training() -> None:
     for _, r in df.iterrows():
         kw_raw = str(r.get(kw_col, "")).strip()
         desc = str(r.get(desc_col, "")).strip()
-        kr_raw = str(r.get(kr_col, "")).strip()
-
         if not kw_raw or not desc:
             continue
 
         kw_norm = _normalize(kw_raw)
-        # keywords_range：用逗號分隔（支援中英文逗號）
-        terms = []
-        if kr_raw:
-            parts = re.split(r"[，,]", kr_raw)
-            terms = [p.strip() for p in parts if p.strip()]
-
-        # 把 terms 也做 normalize，並移除過短詞（例如 1 字太容易誤判）
-        norm_terms = []
-        for t in terms:
-            nt = _normalize(t)
-            if len(nt) >= 2:
-                norm_terms.append(nt)
-
-        # 年度從 keywords 抓：113年xxxx => 113
         y = _extract_year(kw_raw)
 
         exact_map[kw_norm] = desc
@@ -120,7 +106,6 @@ def _load_training() -> None:
             keyword=kw_raw,
             keyword_norm=kw_norm,
             year=y,
-            range_terms=norm_terms,
             description=desc
         ))
 
@@ -140,21 +125,25 @@ def _match_by_exact(user_text: str) -> Optional[str]:
     return _EXACT_MAP.get(key)
 
 
-def _score_range_match(entry: Entry, user_norm: str) -> int:
-    """對 keywords_range 進行粗略打分：命中詞越多、詞越長分數越高。"""
-    score = 0
-    for t in entry.range_terms:
-        if t and t in user_norm:
-            score += len(t)
-    return score
-
-
-def _match_by_range(user_text: str) -> Optional[str]:
+def _coverage_ratio(keyword_norm: str, user_norm: str) -> float:
     """
-    次 key：keywords_range。
-    - 先用「年度」縮小候選（使用者有打年度才做過濾）
-    - 再依命中詞長度加總打分
-    - 避免太寬鬆：至少要命中一個「非年度」的長詞（>=3）
+    覆蓋率：keywords 裡的字元，有多少也出現在 user。
+    用 Counter 可以處理重複字（例如「處處」這種情況）。
+    """
+    if not keyword_norm:
+        return 0.0
+    kw = Counter(keyword_norm)
+    us = Counter(user_norm)
+    hit = sum(min(cnt, us.get(ch, 0)) for ch, cnt in kw.items())
+    return hit / max(1, len(keyword_norm))
+
+
+def _match_by_keyword_coverage(user_text: str, threshold: float = COVERAGE_THRESHOLD) -> Optional[str]:
+    """
+    80% 覆蓋率比對：
+    - 使用者輸入需涵蓋 keywords 至少 threshold（預設 0.8）
+    - 若使用者有輸入年度，先用年度縮小候選
+    - 同分時偏好較長的 keywords（更具體）
     """
     user_norm = _normalize(user_text)
     if not user_norm:
@@ -166,24 +155,15 @@ def _match_by_range(user_text: str) -> Optional[str]:
     if user_year:
         candidates = [e for e in candidates if e.year == user_year]
 
-    best: Optional[Tuple[int, int, Entry]] = None
+    best: Optional[Tuple[float, int, Entry]] = None
     for e in candidates:
-        if not e.range_terms:
+        r = _coverage_ratio(e.keyword_norm, user_norm)
+        if r < threshold:
             continue
 
-        score = _score_range_match(e, user_norm)
-        if score <= 0:
-            continue
-
-        # 強制：至少命中一個 >=3 的詞（避免只打「113年道路養護工程處」就誤帶出各種職員類）
-        hit_long = any((t in user_norm) and (len(t) >= 3) for t in e.range_terms)
-        if not hit_long:
-            continue
-
-        # tie-break：同分時偏好 keyword 較長（較具體）
-        tie = len(e.keyword_norm)
-        if best is None or (score, tie) > (best[0], best[1]):
-            best = (score, tie, e)
+        tie = len(e.keyword_norm)  # 越長越具體
+        if best is None or (r, tie) > (best[0], best[1]):
+            best = (r, tie, e)
 
     return best[2].description if best else None
 
@@ -192,7 +172,7 @@ def build_reply(user_text: str) -> str:
     """
     需求：
     1) 使用者輸入與 keywords 完全符合 -> 回傳該列 description
-    2) 否則比對 keywords_range -> 回傳最符合的一列 description
+    2) 否則比對 keywords 覆蓋率 >= 80% -> 回傳最符合的一列 description
     3) 都找不到 -> 回傳固定道歉訊息
     """
     text = (user_text or "").strip()
@@ -203,7 +183,7 @@ def build_reply(user_text: str) -> str:
     if ans:
         return ans
 
-    ans = _match_by_range(text)
+    ans = _match_by_keyword_coverage(text, threshold=COVERAGE_THRESHOLD)
     if ans:
         return ans
 
