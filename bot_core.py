@@ -28,6 +28,9 @@ MAX_YEAR_SPAN = int(os.environ.get("MAX_YEAR_SPAN", "10"))
 # 輸入太短時先引導
 MIN_QUERY_LEN = int(os.environ.get("MIN_QUERY_LEN", "8"))
 
+# 年度差異摘要「開關」關鍵字：只有出現這些字才顯示摘要
+ANALYSIS_KEYWORDS = ["比較", "變化", "異動", "差異", "增減", "趨勢"]
+
 # 額外：常見同義/寫法修正（可再擴充）
 _REPLACEMENTS = [
     ("年度", "年"),
@@ -37,6 +40,20 @@ _REPLACEMENTS = [
 
 _PUNCT_RE = re.compile(r"[，,。．、\s]+")
 _YEAR_RE = re.compile(r"(?P<y>\d{3})\s*年")
+
+
+def _wants_summary(user_text: str) -> bool:
+    """輸入含「比較/變化/異動...」才顯示年度差異摘要。"""
+    t = str(user_text or "")
+    return any(k in t for k in ANALYSIS_KEYWORDS)
+
+
+def _strip_analysis_keywords(text: str) -> str:
+    """把『比較/變化/異動...』等分析詞從查詢中移除，避免影響題庫匹配。"""
+    t = str(text or "")
+    for k in ANALYSIS_KEYWORDS:
+        t = t.replace(k, "")
+    return t.strip()
 
 
 def _normalize(text: str) -> str:
@@ -327,9 +344,13 @@ def _extract_total_people(ans_text: str) -> Optional[int]:
     return None
 
 
-def _format_multiyear_reply(base_topic: str, years: List[int], year_to_text: Dict[int, Optional[str]]) -> str:
+def _format_multiyear_reply(
+    years: List[int],
+    year_to_text: Dict[int, Optional[str]],
+    show_summary: bool
+) -> str:
     """
-    多年度格式化：每年一段；缺漏年度集中列示；最後附年度差異摘要。
+    多年度格式化：每年一段；缺漏年度集中列示；必要時附年度差異摘要。
     （不顯示『多年度查詢標題』）
     """
     if not years:
@@ -352,26 +373,26 @@ def _format_multiyear_reply(base_topic: str, years: List[int], year_to_text: Dic
         miss = "、".join([f"{m}年" for m in sorted(missing, reverse=True)])
         body = f"{body}\n\n（查無資料年度：{miss}）"
 
-    # ===== 年度差異摘要（有足夠資料才顯示）=====
-    totals: Dict[int, int] = {}
-    for y in sorted(years):
-        ans = year_to_text.get(y)
-        t = _extract_total_people(ans) if ans else None
-        if t is not None:
-            totals[y] = t
+    # ===== 年度差異摘要（開關 + 有足夠資料才顯示）=====
+    if show_summary:
+        totals: Dict[int, int] = {}
+        for y in sorted(years):
+            ans = year_to_text.get(y)
+            t = _extract_total_people(ans) if ans else None
+            if t is not None:
+                totals[y] = t
 
-    if len(totals) >= 2:
-        ys = sorted(totals.keys())
-        summary_lines = ["（年度差異摘要）"]
-        for i in range(1, len(ys)):
-            y1, y2 = ys[i - 1], ys[i]
-            v1, v2 = totals[y1], totals[y2]
-            diff = v2 - v1
-            pct = (diff / v1 * 100) if v1 != 0 else 0.0
-            sign = "+" if diff >= 0 else ""
-            summary_lines.append(f"{y2}年較{y1}年 {sign}{diff}人（{sign}{pct:.2f}%）")
-
-        body = f"{body}\n\n" + "\n".join(summary_lines)
+        if len(totals) >= 2:
+            ys = sorted(totals.keys())
+            summary_lines = ["（年度差異摘要）"]
+            for i in range(1, len(ys)):
+                y1, y2 = ys[i - 1], ys[i]
+                v1, v2 = totals[y1], totals[y2]
+                diff = v2 - v1
+                pct = (diff / v1 * 100) if v1 != 0 else 0.0
+                sign = "+" if diff >= 0 else ""
+                summary_lines.append(f"{y2}年較{y1}年 {sign}{diff}人（{sign}{pct:.2f}%）")
+            body = f"{body}\n\n" + "\n".join(summary_lines)
 
     return body
 
@@ -389,14 +410,18 @@ def build_reply(user_text: str) -> str:
 
     # 多年度：至少 2 年才進入合併模式
     if len(years) >= 2:
-        base_topic = strip_year_expression(text)
-        year_to_text: Dict[int, Optional[str]] = {}
+        show_summary = _wants_summary(text)
 
+        # 移除分析關鍵字，避免影響題庫匹配
+        cleaned = _strip_analysis_keywords(text)
+        base_topic = strip_year_expression(cleaned)
+
+        year_to_text: Dict[int, Optional[str]] = {}
         for y in years:
             q = f"{y}年{base_topic}"
             year_to_text[y] = build_reply_single_year(q)
 
-        return _format_multiyear_reply(base_topic, years, year_to_text)
+        return _format_multiyear_reply(years, year_to_text, show_summary)
 
     # 單年度：維持原本行為
     return build_reply_single_year(text)
