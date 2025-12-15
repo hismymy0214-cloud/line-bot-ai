@@ -258,7 +258,7 @@ def _rank_matches_noyear(user_text: str) -> List[Tuple[float, int, Entry]]:
 
 def build_reply_single_year(user_text: str) -> str:
     """
-    你原本的單年度邏輯（完整保留）。
+    單年度查詢邏輯（完整保留）。
     """
     text = (user_text or "").strip()
     if not text:
@@ -314,9 +314,23 @@ def build_reply_single_year(user_text: str) -> str:
     return DEFAULT_REPLY
 
 
+def _extract_total_people(ans_text: str) -> Optional[int]:
+    """
+    從回覆文字中抓總計人數（只抓總計/總數/合計後面的數字）：
+    例如：總計524人 / 總數524人 / 合計524人
+    """
+    if not ans_text:
+        return None
+    m = re.search(r"(總計|總數|合計)\s*(\d+)\s*人", ans_text)
+    if m:
+        return int(m.group(2))
+    return None
+
+
 def _format_multiyear_reply(base_topic: str, years: List[int], year_to_text: Dict[int, Optional[str]]) -> str:
     """
-    多年度格式化：每年一段；缺漏年度集中列示。
+    多年度格式化：每年一段；缺漏年度集中列示；最後附年度差異摘要。
+    （不顯示『多年度查詢標題』）
     """
     if not years:
         return DEFAULT_REPLY
@@ -324,7 +338,8 @@ def _format_multiyear_reply(base_topic: str, years: List[int], year_to_text: Dic
     blocks: List[str] = []
     missing: List[int] = []
 
-    for y in sorted(years, reverse=True):  # 新到舊
+    # 年度資料（新到舊）
+    for y in sorted(years, reverse=True):
         ans = year_to_text.get(y)
         if not ans or ans == DEFAULT_REPLY:
             missing.append(y)
@@ -337,13 +352,34 @@ def _format_multiyear_reply(base_topic: str, years: List[int], year_to_text: Dic
         miss = "、".join([f"{m}年" for m in sorted(missing, reverse=True)])
         body = f"{body}\n\n（查無資料年度：{miss}）"
 
+    # ===== 年度差異摘要（有足夠資料才顯示）=====
+    totals: Dict[int, int] = {}
+    for y in sorted(years):
+        ans = year_to_text.get(y)
+        t = _extract_total_people(ans) if ans else None
+        if t is not None:
+            totals[y] = t
+
+    if len(totals) >= 2:
+        ys = sorted(totals.keys())
+        summary_lines = ["（年度差異摘要）"]
+        for i in range(1, len(ys)):
+            y1, y2 = ys[i - 1], ys[i]
+            v1, v2 = totals[y1], totals[y2]
+            diff = v2 - v1
+            pct = (diff / v1 * 100) if v1 != 0 else 0.0
+            sign = "+" if diff >= 0 else ""
+            summary_lines.append(f"{y2}年較{y1}年 {sign}{diff}人（{sign}{pct:.2f}%）")
+
+        body = f"{body}\n\n" + "\n".join(summary_lines)
+
     return body
 
 
 def build_reply(user_text: str) -> str:
     """
     多年度入口：偵測到「年度範圍」就拆成多筆單年度查詢，最後合併回覆。
-    否則走原單年度流程。
+    否則走單年度流程。
     """
     text = (user_text or "").strip()
     if not text:
