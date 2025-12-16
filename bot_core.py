@@ -31,6 +31,25 @@ MIN_QUERY_LEN = int(os.environ.get("MIN_QUERY_LEN", "8"))
 # 年度差異摘要「開關」關鍵字：只有出現這些字才顯示摘要
 ANALYSIS_KEYWORDS = ["比較", "變化", "異動", "差異", "增減", "趨勢"]
 
+# ===== 滿意度調查（查到/查不到 分流）=====
+SURVEY_URL = os.environ.get("SURVEY_URL", "https://forms.gle/HCLmWz3br3egcBRN8")
+
+SURVEY_FOOTER_SUCCESS = (
+    "────────────────\n"
+    "📊 滿意度調查（約 30 秒）\n"
+    "為持續精進「AI 工務局主計問答系統」，誠摯邀請您填寫使用體驗回饋與建議：\n"
+    f"👉 {SURVEY_URL}\n"
+    "（本問卷不蒐集個人資料，僅作系統改善參考，感謝您的協助）"
+)
+
+SURVEY_FOOTER_FALLBACK = (
+    "────────────────\n"
+    "📝 回饋與建議\n"
+    "若本系統回覆不符合您的查詢需求，可否協助提供您寶貴的建議事項，"
+    "作為本系統後續精進與資料更新之參考：\n"
+    f"👉 {SURVEY_URL}"
+)
+
 # 額外：常見同義/寫法修正（可再擴充）
 _REPLACEMENTS = [
     ("年度", "年"),
@@ -380,96 +399,6 @@ def _extract_source_text_and_url(ans_text: str) -> Tuple[str, str]:
     return source_text, source_url
 
 
-def _format_multiyear_compact_line(year: int, base_topic: str, total: Optional[int]) -> str:
-    """
-    多年度時：只顯示各年度「總計」一行，避免男/女細項造成畫面過長。
-    例：
-      【113年】
-      113年工務局暨所屬職員總計524人
-    """
-    topic = (base_topic or "").strip()
-
-    # 小調整：若主題最後是「人數」，把尾端「人數」拿掉讓句子更順
-    if topic.endswith("人數"):
-        topic = topic[:-2]  # 移除「人數」
-
-    if total is None:
-        return f"【{year}年】\n{year}年{topic}（查無總計數字）"
-
-    return f"【{year}年】\n{year}年{topic}總計{total}人"
-
-
-def _trend_sentence_from_totals(years: List[int], totals: Dict[int, int]) -> str:
-    """
-    選項A：依多年度總計自動產生一句「趨勢文字」。
-    規則（保守、可解釋）：
-      - 先看整段（第一年 vs 最後一年）方向與幅度
-      - 再看波動程度（max-min 相對平均）
-      - 再看最近一年（最後一年 vs 前一年）是否回升/下滑/持平
-    """
-    ys = sorted([y for y in years if y in totals])
-    if len(ys) < 2:
-        return ""
-
-    first_y, last_y = ys[0], ys[-1]
-    first_v, last_v = totals[first_y], totals[last_y]
-    diff = last_v - first_v
-    base = first_v if first_v != 0 else 1
-    diff_pct = diff / base * 100.0
-
-    series = [totals[y] for y in ys]
-    avg = sum(series) / max(1, len(series))
-    rng = max(series) - min(series)
-    vol_ratio = (rng / avg) if avg != 0 else 0.0
-
-    # 1) 整體趨勢（保守用詞）
-    if abs(diff_pct) < 1.0:
-        overall = "整體大致持平"
-    else:
-        if diff > 0:
-            overall = "整體呈現小幅成長" if abs(diff_pct) < 5.0 else "整體呈現成長"
-        else:
-            overall = "整體呈現小幅下降" if abs(diff_pct) < 5.0 else "整體呈現下降"
-
-    # 2) 波動程度（只在有意義時改用「波動」描述）
-    if vol_ratio <= 0.03:
-        volatility = "相對穩定"
-    elif vol_ratio <= 0.08:
-        volatility = "呈現小幅波動"
-    else:
-        volatility = "波動較明顯"
-
-    # 3) 最近一年 vs 前一年
-    recent_phrase = ""
-    if len(ys) >= 2:
-        prev_y = ys[-2]
-        prev_v = totals[prev_y]
-        recent_diff = last_v - prev_v
-        if recent_diff > 0:
-            recent_phrase = f"{last_y}年較前期略為回升"
-        elif recent_diff < 0:
-            recent_phrase = f"{last_y}年較前期略為下滑"
-        else:
-            recent_phrase = f"{last_y}年與前期持平"
-
-    # 組句（盡量自然、不冗）
-    # 若 overall 本身已經是「大致持平」，波動就優先描述穩定/波動
-    period = f"{first_y}–{last_y}年"
-    if overall == "整體大致持平":
-        main = f"{period}整體{volatility}"
-    else:
-        # 成長/下降同時帶波動，避免句子太長
-        if volatility in ("相對穩定",):
-            main = f"{period}{overall}，走勢{volatility}"
-        else:
-            main = f"{period}整體{volatility}"
-
-    if recent_phrase:
-        return f"（趨勢摘要）\n{main}，{recent_phrase}。"
-
-    return f"（趨勢摘要）\n{main}。"
-
-
 def _format_multiyear_reply(
     years: List[int],
     year_to_text: Dict[int, Optional[str]],
@@ -477,7 +406,7 @@ def _format_multiyear_reply(
     show_summary: bool,
 ) -> str:
     """
-    多年度格式化：
+    多年度格式化（保持你目前版本）：
     - 只列出各年度「總計」(精簡版)
     - 缺漏年度集中列示
     - 必要時附年度差異摘要（仍以「總計」計算）
@@ -495,6 +424,64 @@ def _format_multiyear_reply(
     source_text = ""
     source_url = ""
 
+    def _format_multiyear_compact_line(year: int, base_topic2: str, total: Optional[int]) -> str:
+        topic = (base_topic2 or "").strip()
+        if topic.endswith("人數"):
+            topic = topic[:-2]
+        if total is None:
+            return f"【{year}年】\n{year}年{topic}（查無總計數字）"
+        return f"【{year}年】\n{year}年{topic}總計{total}人"
+
+    def _trend_sentence_from_totals(years2: List[int], totals2: Dict[int, int]) -> str:
+        ys = sorted([y for y in years2 if y in totals2])
+        if len(ys) < 2:
+            return ""
+
+        first_y, last_y = ys[0], ys[-1]
+        first_v, last_v = totals2[first_y], totals2[last_y]
+        diff = last_v - first_v
+        base = first_v if first_v != 0 else 1
+        diff_pct = diff / base * 100.0
+
+        series = [totals2[y] for y in ys]
+        avg = sum(series) / max(1, len(series))
+        rng = max(series) - min(series)
+        vol_ratio = (rng / avg) if avg != 0 else 0.0
+
+        if abs(diff_pct) < 1.0:
+            overall = "整體大致持平"
+        else:
+            overall = "整體呈現小幅成長" if diff > 0 and abs(diff_pct) < 5.0 else (
+                "整體呈現成長" if diff > 0 else ("整體呈現小幅下降" if abs(diff_pct) < 5.0 else "整體呈現下降")
+            )
+
+        if vol_ratio <= 0.03:
+            volatility = "相對穩定"
+        elif vol_ratio <= 0.08:
+            volatility = "呈現小幅波動"
+        else:
+            volatility = "波動較明顯"
+
+        recent_phrase = ""
+        if len(ys) >= 2:
+            prev_y = ys[-2]
+            prev_v = totals2[prev_y]
+            recent_diff = last_v - prev_v
+            if recent_diff > 0:
+                recent_phrase = f"{last_y}年較前期略為回升"
+            elif recent_diff < 0:
+                recent_phrase = f"{last_y}年較前期略為下滑"
+            else:
+                recent_phrase = f"{last_y}年與前期持平"
+
+        period = f"{first_y}–{last_y}年"
+        if overall == "整體大致持平":
+            main = f"{period}整體{volatility}"
+        else:
+            main = f"{period}{overall}，走勢{volatility}" if volatility == "相對穩定" else f"{period}整體{volatility}"
+
+        return f"（趨勢摘要）\n{main}，{recent_phrase}。" if recent_phrase else f"（趨勢摘要）\n{main}。"
+
     # 年度資料（新到舊）
     for y in sorted(years, reverse=True):
         ans = year_to_text.get(y)
@@ -502,7 +489,6 @@ def _format_multiyear_reply(
             missing.append(y)
             continue
 
-        # 只取第一筆來源（避免重複）
         if not source_url and not source_text:
             st, su = _extract_source_text_and_url(ans)
             source_text = st
@@ -522,7 +508,6 @@ def _format_multiyear_reply(
         miss = "、".join([f"{m}年" for m in sorted(missing, reverse=True)])
         body = f"{body}\n\n（查無資料年度：{miss}）"
 
-    # 多年度來源：顯示一次（來源文字 + URL）
     if source_text or source_url:
         body = f"{body}\n\n（資料來源）"
         if source_text:
@@ -530,13 +515,11 @@ def _format_multiyear_reply(
         if source_url:
             body += f"\n{source_url}"
 
-    # ===== 選項A：趨勢摘要（只在 show_summary=True 且資料足夠時）=====
     if show_summary and len(totals) >= 2:
         trend = _trend_sentence_from_totals(years, totals)
         if trend:
             body = f"{body}\n\n{trend}"
 
-    # ===== 年度差異摘要（開關 + 有足夠資料才顯示）=====
     if show_summary and len(totals) >= 2:
         ys = sorted(totals.keys())
         summary_lines = ["（年度差異摘要）"]
@@ -552,14 +535,61 @@ def _format_multiyear_reply(
     return body
 
 
+# =========================
+# footer 分流：查到 / 查不到
+# =========================
+def _is_success_reply(reply: str) -> bool:
+    """
+    判斷「是否查到資料」：
+    - DEFAULT_REPLY -> 失敗
+    - 引導/提醒/候選 -> 視為未查到（使用 fallback 文案）
+    - 多年度全無 -> 視為未查到
+    - 其餘 -> 視為查到（使用 success 文案）
+    """
+    r = (reply or "").strip()
+    if not r:
+        return False
+
+    if r == DEFAULT_REPLY:
+        return False
+
+    # 引導/提醒/候選（這些都不算「查到資料」）
+    if r.startswith("請輸入更完整的查詢關鍵詞"):
+        return False
+    if r.startswith("看起來您可能少輸入「年度」"):
+        return False
+    if r.startswith("您是不是要找下列資料："):
+        return False
+
+    # 多年度全無
+    if "（本次範圍內皆查無符合資料）" in r:
+        return False
+
+    return True
+
+
+def _append_survey_footer(reply: str) -> str:
+    """
+    依「查到/查不到」附上不同文案（避免重複附加）。
+    """
+    r = (reply or "").rstrip()
+    if SURVEY_URL in r:
+        return r  # 已附過就不再附
+
+    footer = SURVEY_FOOTER_SUCCESS if _is_success_reply(r) else SURVEY_FOOTER_FALLBACK
+    return f"{r}\n\n{footer}" if r else footer
+
+
 def build_reply(user_text: str) -> str:
     """
     多年度入口：偵測到「年度範圍」就拆成多筆單年度查詢，最後合併回覆。
     否則走單年度流程。
+
+    最後依「查到/查不到」附上不同滿意度/建議文案。
     """
     text = (user_text or "").strip()
     if not text:
-        return DEFAULT_REPLY
+        return _append_survey_footer(DEFAULT_REPLY)
 
     years = extract_years(text)
 
@@ -567,7 +597,6 @@ def build_reply(user_text: str) -> str:
     if len(years) >= 2:
         show_summary = _wants_summary(text)
 
-        # 移除分析關鍵字，避免影響題庫匹配
         cleaned = _strip_analysis_keywords(text)
         base_topic = strip_year_expression(cleaned)
 
@@ -576,7 +605,9 @@ def build_reply(user_text: str) -> str:
             q = f"{y}年{base_topic}"
             year_to_text[y] = build_reply_single_year(q)
 
-        return _format_multiyear_reply(years, year_to_text, base_topic, show_summary)
+        reply = _format_multiyear_reply(years, year_to_text, base_topic, show_summary)
+        return _append_survey_footer(reply)
 
-    # 單年度：維持原本行為（單年度仍回完整內容：含男/女、占比、來源等）
-    return build_reply_single_year(text)
+    # 單年度
+    reply = build_reply_single_year(text)
+    return _append_survey_footer(reply)
