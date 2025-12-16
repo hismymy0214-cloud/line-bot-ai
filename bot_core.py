@@ -584,7 +584,7 @@ def _append_survey_footer(reply: str) -> str:
         return r  # 已附過就不再附
 
     footer = SURVEY_FOOTER_SUCCESS if _is_success_reply(r) else SURVEY_FOOTER_FALLBACK
-    return f"{r}\n\n{footer}" if r else footer
+    return f"{r.rstrip()}\n{footer}" if r else footer
 
 
 def build_reply(user_text: str) -> str:
