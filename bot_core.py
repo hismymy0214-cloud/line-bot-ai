@@ -32,7 +32,7 @@ MIN_QUERY_LEN = int(os.environ.get("MIN_QUERY_LEN", "8"))
 ANALYSIS_KEYWORDS = ["比較", "變化", "異動", "差異", "增減", "趨勢"]
 
 # ===== 滿意度調查（查到/查不到 分流）=====
-SURVEY_URL = os.environ.get("SURVEY_URL", "https://forms.gle/HCLmWz3br3egcBRN8")
+SURVEY_URL = os.environ.get("SURVEY_URL", "https://forms.gle/EzvDwUyq5A8sCQrS7")
 
 SURVEY_FOOTER_SUCCESS = (
     "────────────────\n"
