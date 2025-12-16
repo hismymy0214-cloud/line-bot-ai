@@ -406,17 +406,17 @@ def _format_multiyear_reply(
     show_summary: bool,
 ) -> str:
     """
-    多年度格式化（保持你目前版本）：
-    - 只列出各年度「總計」(精簡版)
+    多年度格式化（新版本）：
+    - 多年度只列「一行一年度」： 113年工務局職員總計524人
+    - 不再用【】與段落空行（更適合 LINE 手機畫面）
     - 缺漏年度集中列示
-    - 必要時附年度差異摘要（仍以「總計」計算）
     - 資料來源顯示一次（來源文字 + URL）
-    - 選項A：若 show_summary=True，額外附「趨勢摘要」一句話
+    - 若 show_summary=True：加趨勢摘要 + 年度差異摘要（仍以總計計算）
     """
     if not years:
         return DEFAULT_REPLY
 
-    blocks: List[str] = []
+    lines_out: List[str] = []
     missing: List[int] = []
 
     totals: Dict[int, int] = {}
@@ -424,13 +424,18 @@ def _format_multiyear_reply(
     source_text = ""
     source_url = ""
 
-    def _format_multiyear_compact_line(year: int, base_topic2: str, total: Optional[int]) -> str:
-        topic = (base_topic2 or "").strip()
-        if topic.endswith("人數"):
-            topic = topic[:-2]
+    def _topic_no_people_suffix(topic: str) -> str:
+        t = (topic or "").strip()
+        if t.endswith("人數"):
+            t = t[:-2]
+        return t
+
+    def _format_multiyear_line(year: int, topic: str, total: Optional[int]) -> str:
+        t = _topic_no_people_suffix(topic)
         if total is None:
-            return f"【{year}年】\n{year}年{topic}（查無總計數字）"
-        return f"【{year}年】\n{year}年{topic}總計{total}人"
+            # 也可改成：f"{year}年{t}（查無總計數字）"
+            return f"{year}年{t}（查無總計數字）"
+        return f"{year}年{t}總計{total}人"
 
     def _trend_sentence_from_totals(years2: List[int], totals2: Dict[int, int]) -> str:
         ys = sorted([y for y in years2 if y in totals2])
@@ -451,8 +456,10 @@ def _format_multiyear_reply(
         if abs(diff_pct) < 1.0:
             overall = "整體大致持平"
         else:
-            overall = "整體呈現小幅成長" if diff > 0 and abs(diff_pct) < 5.0 else (
-                "整體呈現成長" if diff > 0 else ("整體呈現小幅下降" if abs(diff_pct) < 5.0 else "整體呈現下降")
+            overall = (
+                "整體呈現小幅成長"
+                if diff > 0 and abs(diff_pct) < 5.0
+                else ("整體呈現成長" if diff > 0 else ("整體呈現小幅下降" if abs(diff_pct) < 5.0 else "整體呈現下降"))
             )
 
         if vol_ratio <= 0.03:
@@ -500,9 +507,9 @@ def _format_multiyear_reply(
         if t is not None:
             totals[y] = t
 
-        blocks.append(_format_multiyear_compact_line(y, base_topic, t))
+        lines_out.append(_format_multiyear_line(y, base_topic, t))
 
-    body = "\n\n".join(blocks) if blocks else "（本次範圍內皆查無符合資料）"
+    body = "\n".join(lines_out) if lines_out else "（本次範圍內皆查無符合資料）"
 
     if missing:
         miss = "、".join([f"{m}年" for m in sorted(missing, reverse=True)])
