@@ -345,27 +345,59 @@ def _extract_total_people(ans_text: str) -> Optional[int]:
 
 
 def _extract_first_url(ans_text: str) -> str:
-    """從回覆文字中抓第一個 URL（用於多年度時只顯示一次來源連結）。"""
+    """從回覆文字中抓第一個 URL。"""
     if not ans_text:
         return ""
     m = re.search(r"(https?://\S+)", ans_text)
     return m.group(1) if m else ""
 
 
+def _extract_source_text_and_url(ans_text: str) -> Tuple[str, str]:
+    """
+    從單年度回覆中擷取：
+    - 資料來源文字（例如：高雄市政府工務局性別統計年報。）
+    - 第一個 URL
+    """
+    if not ans_text:
+        return "", ""
+
+    lines = [l.strip() for l in ans_text.splitlines() if l.strip()]
+
+    source_text = ""
+    source_url = ""
+
+    for i, line in enumerate(lines):
+        # URL
+        if not source_url:
+            m = re.search(r"(https?://\S+)", line)
+            if m:
+                source_url = m.group(1)
+
+        # 來源文字（通常在「(資料來源)」或「資料來源」後一行）
+        if "資料來源" in line and i + 1 < len(lines):
+            source_text = lines[i + 1]
+
+    # 保底：如果抓不到來源文字，但 URL 存在，就留空文字也沒關係
+    return source_text, source_url
+
+
 def _format_multiyear_compact_line(year: int, base_topic: str, total: Optional[int]) -> str:
     """
     多年度時：只顯示各年度「總計」一行，避免男/女細項造成畫面過長。
     例：
-      【113年】113年工務局暨所屬職員總計524人
+      【113年】
+      113年工務局暨所屬職員總計524人
     """
     topic = (base_topic or "").strip()
 
-    # 小調整：把「人數」改得更順
-    topic = topic.replace("人數", "職員") if topic.endswith("人數") else topic
+    # 小調整：若主題最後是「人數」，把尾端「人數」拿掉讓句子更順
+    # 例：工務局暨所屬職員人數 -> 工務局暨所屬職員
+    if topic.endswith("人數"):
+        topic = topic[:-2]  # 移除「人數」
 
     if total is None:
-        # 抓不到總計就退回：仍顯示題目，但標註查無總計
         return f"【{year}年】\n{year}年{topic}（查無總計數字）"
+
     return f"【{year}年】\n{year}年{topic}總計{total}人"
 
 
@@ -380,7 +412,7 @@ def _format_multiyear_reply(
     - 只列出各年度「總計」(精簡版)
     - 缺漏年度集中列示
     - 必要時附年度差異摘要（仍以「總計」計算）
-    - 資料來源/連結只顯示一次（取第一個有的）
+    - 資料來源顯示一次（來源文字 + URL）
     """
     if not years:
         return DEFAULT_REPLY
@@ -389,6 +421,8 @@ def _format_multiyear_reply(
     missing: List[int] = []
 
     totals: Dict[int, int] = {}
+
+    source_text = ""
     source_url = ""
 
     # 年度資料（新到舊）
@@ -398,7 +432,12 @@ def _format_multiyear_reply(
             missing.append(y)
             continue
 
-        if not source_url:
+        # 只取第一筆來源（避免重複）
+        if not source_url and not source_text:
+            st, su = _extract_source_text_and_url(ans)
+            source_text = st
+            source_url = su
+        elif not source_url:
             source_url = _extract_first_url(ans)
 
         t = _extract_total_people(ans)
@@ -413,9 +452,13 @@ def _format_multiyear_reply(
         miss = "、".join([f"{m}年" for m in sorted(missing, reverse=True)])
         body = f"{body}\n\n（查無資料年度：{miss}）"
 
-    # 多年度來源：只顯示一次（不再重複『來源：...』那行，以免太長）
-    if source_url:
-        body = f"{body}\n\n（資料來源）\n{source_url}"
+    # 多年度來源：顯示一次（來源文字 + URL）
+    if source_text or source_url:
+        body = f"{body}\n\n（資料來源）"
+        if source_text:
+            body += f"\n{source_text}"
+        if source_url:
+            body += f"\n{source_url}"
 
     # ===== 年度差異摘要（開關 + 有足夠資料才顯示）=====
     if show_summary and len(totals) >= 2:
