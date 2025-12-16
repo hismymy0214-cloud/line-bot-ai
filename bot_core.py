@@ -203,7 +203,7 @@ def _load_training() -> None:
             keyword_norm_noyear=kw_norm_noyear,
             year=y,
             description=desc,
-            source_url=src
+            source_url=src,
         )
 
         exact_map[kw_norm] = e
@@ -344,14 +344,43 @@ def _extract_total_people(ans_text: str) -> Optional[int]:
     return None
 
 
+def _extract_first_url(ans_text: str) -> str:
+    """從回覆文字中抓第一個 URL（用於多年度時只顯示一次來源連結）。"""
+    if not ans_text:
+        return ""
+    m = re.search(r"(https?://\S+)", ans_text)
+    return m.group(1) if m else ""
+
+
+def _format_multiyear_compact_line(year: int, base_topic: str, total: Optional[int]) -> str:
+    """
+    多年度時：只顯示各年度「總計」一行，避免男/女細項造成畫面過長。
+    例：
+      【113年】113年工務局暨所屬職員總計524人
+    """
+    topic = (base_topic or "").strip()
+
+    # 小調整：把「人數」改得更順
+    topic = topic.replace("人數", "職員") if topic.endswith("人數") else topic
+
+    if total is None:
+        # 抓不到總計就退回：仍顯示題目，但標註查無總計
+        return f"【{year}年】\n{year}年{topic}（查無總計數字）"
+    return f"【{year}年】\n{year}年{topic}總計{total}人"
+
+
 def _format_multiyear_reply(
     years: List[int],
     year_to_text: Dict[int, Optional[str]],
-    show_summary: bool
+    base_topic: str,
+    show_summary: bool,
 ) -> str:
     """
-    多年度格式化：每年一段；缺漏年度集中列示；必要時附年度差異摘要。
-    （不顯示『多年度查詢標題』）
+    多年度格式化：
+    - 只列出各年度「總計」(精簡版)
+    - 缺漏年度集中列示
+    - 必要時附年度差異摘要（仍以「總計」計算）
+    - 資料來源/連結只顯示一次（取第一個有的）
     """
     if not years:
         return DEFAULT_REPLY
@@ -359,13 +388,24 @@ def _format_multiyear_reply(
     blocks: List[str] = []
     missing: List[int] = []
 
+    totals: Dict[int, int] = {}
+    source_url = ""
+
     # 年度資料（新到舊）
     for y in sorted(years, reverse=True):
         ans = year_to_text.get(y)
         if not ans or ans == DEFAULT_REPLY:
             missing.append(y)
             continue
-        blocks.append(f"【{y}年】\n{ans}")
+
+        if not source_url:
+            source_url = _extract_first_url(ans)
+
+        t = _extract_total_people(ans)
+        if t is not None:
+            totals[y] = t
+
+        blocks.append(_format_multiyear_compact_line(y, base_topic, t))
 
     body = "\n\n".join(blocks) if blocks else "（本次範圍內皆查無符合資料）"
 
@@ -373,26 +413,22 @@ def _format_multiyear_reply(
         miss = "、".join([f"{m}年" for m in sorted(missing, reverse=True)])
         body = f"{body}\n\n（查無資料年度：{miss}）"
 
-    # ===== 年度差異摘要（開關 + 有足夠資料才顯示）=====
-    if show_summary:
-        totals: Dict[int, int] = {}
-        for y in sorted(years):
-            ans = year_to_text.get(y)
-            t = _extract_total_people(ans) if ans else None
-            if t is not None:
-                totals[y] = t
+    # 多年度來源：只顯示一次（不再重複『來源：...』那行，以免太長）
+    if source_url:
+        body = f"{body}\n\n（資料來源）\n{source_url}"
 
-        if len(totals) >= 2:
-            ys = sorted(totals.keys())
-            summary_lines = ["（年度差異摘要）"]
-            for i in range(1, len(ys)):
-                y1, y2 = ys[i - 1], ys[i]
-                v1, v2 = totals[y1], totals[y2]
-                diff = v2 - v1
-                pct = (diff / v1 * 100) if v1 != 0 else 0.0
-                sign = "+" if diff >= 0 else ""
-                summary_lines.append(f"{y2}年較{y1}年 {sign}{diff}人（{sign}{pct:.2f}%）")
-            body = f"{body}\n\n" + "\n".join(summary_lines)
+    # ===== 年度差異摘要（開關 + 有足夠資料才顯示）=====
+    if show_summary and len(totals) >= 2:
+        ys = sorted(totals.keys())
+        summary_lines = ["（年度差異摘要）"]
+        for i in range(1, len(ys)):
+            y1, y2 = ys[i - 1], ys[i]
+            v1, v2 = totals[y1], totals[y2]
+            diff = v2 - v1
+            pct = (diff / v1 * 100) if v1 != 0 else 0.0
+            sign = "+" if diff >= 0 else ""
+            summary_lines.append(f"{y2}年較{y1}年 {sign}{diff}人（{sign}{pct:.2f}%）")
+        body = f"{body}\n\n" + "\n".join(summary_lines)
 
     return body
 
@@ -421,7 +457,7 @@ def build_reply(user_text: str) -> str:
             q = f"{y}年{base_topic}"
             year_to_text[y] = build_reply_single_year(q)
 
-        return _format_multiyear_reply(years, year_to_text, show_summary)
+        return _format_multiyear_reply(years, year_to_text, base_topic, show_summary)
 
-    # 單年度：維持原本行為
+    # 單年度：維持原本行為（單年度仍回完整內容：含男/女、占比、來源等）
     return build_reply_single_year(text)
