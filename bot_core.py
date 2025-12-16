@@ -43,7 +43,7 @@ _YEAR_RE = re.compile(r"(?P<y>\d{3})\s*年")
 
 
 def _wants_summary(user_text: str) -> bool:
-    """輸入含「比較/變化/異動...」才顯示年度差異摘要。"""
+    """輸入含「比較/變化/異動...」才顯示年度差異摘要（含趨勢一句話）。"""
     t = str(user_text or "")
     return any(k in t for k in ANALYSIS_KEYWORDS)
 
@@ -377,7 +377,6 @@ def _extract_source_text_and_url(ans_text: str) -> Tuple[str, str]:
         if "資料來源" in line and i + 1 < len(lines):
             source_text = lines[i + 1]
 
-    # 保底：如果抓不到來源文字，但 URL 存在，就留空文字也沒關係
     return source_text, source_url
 
 
@@ -391,7 +390,6 @@ def _format_multiyear_compact_line(year: int, base_topic: str, total: Optional[i
     topic = (base_topic or "").strip()
 
     # 小調整：若主題最後是「人數」，把尾端「人數」拿掉讓句子更順
-    # 例：工務局暨所屬職員人數 -> 工務局暨所屬職員
     if topic.endswith("人數"):
         topic = topic[:-2]  # 移除「人數」
 
@@ -399,6 +397,77 @@ def _format_multiyear_compact_line(year: int, base_topic: str, total: Optional[i
         return f"【{year}年】\n{year}年{topic}（查無總計數字）"
 
     return f"【{year}年】\n{year}年{topic}總計{total}人"
+
+
+def _trend_sentence_from_totals(years: List[int], totals: Dict[int, int]) -> str:
+    """
+    選項A：依多年度總計自動產生一句「趨勢文字」。
+    規則（保守、可解釋）：
+      - 先看整段（第一年 vs 最後一年）方向與幅度
+      - 再看波動程度（max-min 相對平均）
+      - 再看最近一年（最後一年 vs 前一年）是否回升/下滑/持平
+    """
+    ys = sorted([y for y in years if y in totals])
+    if len(ys) < 2:
+        return ""
+
+    first_y, last_y = ys[0], ys[-1]
+    first_v, last_v = totals[first_y], totals[last_y]
+    diff = last_v - first_v
+    base = first_v if first_v != 0 else 1
+    diff_pct = diff / base * 100.0
+
+    series = [totals[y] for y in ys]
+    avg = sum(series) / max(1, len(series))
+    rng = max(series) - min(series)
+    vol_ratio = (rng / avg) if avg != 0 else 0.0
+
+    # 1) 整體趨勢（保守用詞）
+    if abs(diff_pct) < 1.0:
+        overall = "整體大致持平"
+    else:
+        if diff > 0:
+            overall = "整體呈現小幅成長" if abs(diff_pct) < 5.0 else "整體呈現成長"
+        else:
+            overall = "整體呈現小幅下降" if abs(diff_pct) < 5.0 else "整體呈現下降"
+
+    # 2) 波動程度（只在有意義時改用「波動」描述）
+    if vol_ratio <= 0.03:
+        volatility = "相對穩定"
+    elif vol_ratio <= 0.08:
+        volatility = "呈現小幅波動"
+    else:
+        volatility = "波動較明顯"
+
+    # 3) 最近一年 vs 前一年
+    recent_phrase = ""
+    if len(ys) >= 2:
+        prev_y = ys[-2]
+        prev_v = totals[prev_y]
+        recent_diff = last_v - prev_v
+        if recent_diff > 0:
+            recent_phrase = f"{last_y}年較前期略為回升"
+        elif recent_diff < 0:
+            recent_phrase = f"{last_y}年較前期略為下滑"
+        else:
+            recent_phrase = f"{last_y}年與前期持平"
+
+    # 組句（盡量自然、不冗）
+    # 若 overall 本身已經是「大致持平」，波動就優先描述穩定/波動
+    period = f"{first_y}–{last_y}年"
+    if overall == "整體大致持平":
+        main = f"{period}整體{volatility}"
+    else:
+        # 成長/下降同時帶波動，避免句子太長
+        if volatility in ("相對穩定",):
+            main = f"{period}{overall}，走勢{volatility}"
+        else:
+            main = f"{period}整體{volatility}"
+
+    if recent_phrase:
+        return f"（趨勢摘要）\n{main}，{recent_phrase}。"
+
+    return f"（趨勢摘要）\n{main}。"
 
 
 def _format_multiyear_reply(
@@ -413,6 +482,7 @@ def _format_multiyear_reply(
     - 缺漏年度集中列示
     - 必要時附年度差異摘要（仍以「總計」計算）
     - 資料來源顯示一次（來源文字 + URL）
+    - 選項A：若 show_summary=True，額外附「趨勢摘要」一句話
     """
     if not years:
         return DEFAULT_REPLY
@@ -459,6 +529,12 @@ def _format_multiyear_reply(
             body += f"\n{source_text}"
         if source_url:
             body += f"\n{source_url}"
+
+    # ===== 選項A：趨勢摘要（只在 show_summary=True 且資料足夠時）=====
+    if show_summary and len(totals) >= 2:
+        trend = _trend_sentence_from_totals(years, totals)
+        if trend:
+            body = f"{body}\n\n{trend}"
 
     # ===== 年度差異摘要（開關 + 有足夠資料才顯示）=====
     if show_summary and len(totals) >= 2:
