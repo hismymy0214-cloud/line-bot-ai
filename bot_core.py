@@ -121,7 +121,6 @@ def extract_years(text: str) -> List[int]:
         lo, hi = min(y1, y2), max(y1, y2)
         span = hi - lo + 1
         if span > MAX_YEAR_SPAN:
-            # 太長就不做多年度（避免被濫用），回空讓後面走單年度提示
             return []
         return list(range(lo, hi + 1))
 
@@ -159,6 +158,7 @@ class Entry:
     keyword_norm_noyear: str
     year: Optional[str]
     description: str
+    unit: str          # ← 由 training.xlsx 的 unit 欄提供
     source_url: str
 
 
@@ -200,6 +200,7 @@ def _load_training() -> None:
     kw_col = colmap["keywords"]
     desc_col = colmap["description"]
     src_col = colmap["source_url"]
+    unit_col = colmap.get("unit")  # unit 欄可有可無
 
     exact_map: Dict[str, Entry] = {}
     entries: List[Entry] = []
@@ -208,6 +209,7 @@ def _load_training() -> None:
         kw_raw = str(r.get(kw_col, "")).strip()
         desc = str(r.get(desc_col, "")).strip()
         src = str(r.get(src_col, "")).strip()
+        unit = str(r.get(unit_col, "")).strip() if unit_col else ""
 
         if not kw_raw or not desc:
             continue
@@ -222,6 +224,7 @@ def _load_training() -> None:
             keyword_norm_noyear=kw_norm_noyear,
             year=y,
             description=desc,
+            unit=unit,
             source_url=src,
         )
 
@@ -294,7 +297,7 @@ def _rank_matches_noyear(user_text: str) -> List[Tuple[float, int, Entry]]:
 
 def build_reply_single_year(user_text: str) -> str:
     """
-    單年度查詢邏輯（完整保留）。
+    單年度查詢邏輯（保留原本互動文案/候選提示）。
     """
     text = (user_text or "").strip()
     if not text:
@@ -350,17 +353,52 @@ def build_reply_single_year(user_text: str) -> str:
     return DEFAULT_REPLY
 
 
-def _extract_total_people(ans_text: str) -> Optional[int]:
+# =========================
+# 多年度專用：取 Entry（不回引導文案）
+# =========================
+def _get_entry_for_year_query(query_text: str) -> Optional[Entry]:
     """
-    從回覆文字中抓總計人數（只抓總計/總數/合計後面的數字）：
-    例如：總計524人 / 總數524人 / 合計524人
+    多年度用：給定「已含年度」的 query（例如：113年工務局職員人數），
+    直接回傳最可能的 Entry；找不到就回 None。
     """
-    if not ans_text:
+    text = (query_text or "").strip()
+    if not text:
         return None
-    m = re.search(r"(總計|總數|合計)\s*(\d+)\s*人", ans_text)
-    if m:
-        return int(m.group(2))
+
+    # 1) 完全符合
+    e_exact = _match_by_exact(text)
+    if e_exact:
+        return e_exact
+
+    # 2) 年度一致下的覆蓋率比對（多年度不做候選提示）
+    ranked = _rank_matches(text, use_year_filter=True)
+    if ranked:
+        best_r, _, best_e = ranked[0]
+        if best_r >= COVERAGE_THRESHOLD:
+            return best_e
+
     return None
+
+
+def _extract_total_value(desc_text: str) -> Optional[int]:
+    """從 description 抓總計/總數/合計後面的數字（允許逗號）。"""
+    if not desc_text:
+        return None
+    m = re.search(r"(總計|總數|合計)\s*([\d,]+)", desc_text)
+    if not m:
+        return None
+    return int(m.group(2).replace(",", ""))
+
+
+def _fallback_extract_unit(desc_text: str) -> str:
+    """
+    若 unit 欄沒填，從 description 嘗試抓短單位（避免完全沒單位）。
+    例：總計524人 / 總計8,194,228千元
+    """
+    if not desc_text:
+        return ""
+    m = re.search(r"(總計|總數|合計)\s*[\d,]+\s*([^\d\s，。；;、()（）]{1,8})", desc_text)
+    return (m.group(2) or "").strip() if m else ""
 
 
 def _extract_first_url(ans_text: str) -> str:
@@ -386,13 +424,11 @@ def _extract_source_text_and_url(ans_text: str) -> Tuple[str, str]:
     source_url = ""
 
     for i, line in enumerate(lines):
-        # URL
         if not source_url:
             m = re.search(r"(https?://\S+)", line)
             if m:
                 source_url = m.group(1)
 
-        # 來源文字（通常在「(資料來源)」或「資料來源」後一行）
         if "資料來源" in line and i + 1 < len(lines):
             source_text = lines[i + 1]
 
@@ -401,17 +437,16 @@ def _extract_source_text_and_url(ans_text: str) -> Tuple[str, str]:
 
 def _format_multiyear_reply(
     years: List[int],
-    year_to_text: Dict[int, Optional[str]],
+    year_to_entry: Dict[int, Optional[Entry]],
     base_topic: str,
     show_summary: bool,
 ) -> str:
     """
-    多年度格式化（新版本）：
-    - 多年度只列「一行一年度」： 113年工務局職員總計524人
-    - 不再用【】與段落空行（更適合 LINE 手機畫面）
+    多年度格式化：
+    - 一行一年度：113年XXX總計NN{unit}
     - 缺漏年度集中列示
     - 資料來源顯示一次（來源文字 + URL）
-    - 若 show_summary=True：加趨勢摘要 + 年度差異摘要（仍以總計計算）
+    - show_summary=True：加趨勢摘要 + 年度差異摘要（用同一單位）
     """
     if not years:
         return DEFAULT_REPLY
@@ -424,20 +459,28 @@ def _format_multiyear_reply(
     source_text = ""
     source_url = ""
 
-    def _topic_no_people_suffix(topic: str) -> str:
+    def _topic_no_suffix(topic: str) -> str:
         t = (topic or "").strip()
+        # 維持你原本習慣：若主題以「人數」結尾，顯示時去掉「人數」
         if t.endswith("人數"):
             t = t[:-2]
         return t
 
-    def _format_multiyear_line(year: int, topic: str, total: Optional[int]) -> str:
-        t = _topic_no_people_suffix(topic)
+    def _format_multiyear_line(year: int, topic: str, total: Optional[int], unit: str) -> str:
+        t = _topic_no_suffix(topic)
         if total is None:
-            # 也可改成：f"{year}年{t}（查無總計數字）"
             return f"{year}年{t}（查無總計數字）"
-        return f"{year}年{t}總計{total}人"
+        return f"{year}年{t}總計{total}{unit}"
 
-    def _trend_sentence_from_totals(years2: List[int], totals2: Dict[int, int]) -> str:
+    def _pick_summary_unit(years_sorted: List[int], unit_map: Dict[int, str]) -> str:
+        # 先取最後一年，再往前找（避免最後一年剛好空）
+        for y in sorted(years_sorted, reverse=True):
+            u = (unit_map.get(y) or "").strip()
+            if u:
+                return u
+        return ""
+
+    def _trend_sentence(years2: List[int], totals2: Dict[int, int], unit: str) -> str:
         ys = sorted([y for y in years2 if y in totals2])
         if len(ys) < 2:
             return ""
@@ -459,7 +502,11 @@ def _format_multiyear_reply(
             overall = (
                 "整體呈現小幅成長"
                 if diff > 0 and abs(diff_pct) < 5.0
-                else ("整體呈現成長" if diff > 0 else ("整體呈現小幅下降" if abs(diff_pct) < 5.0 else "整體呈現下降"))
+                else (
+                    "整體呈現成長"
+                    if diff > 0
+                    else ("整體呈現小幅下降" if abs(diff_pct) < 5.0 else "整體呈現下降")
+                )
             )
 
         if vol_ratio <= 0.03:
@@ -487,27 +534,41 @@ def _format_multiyear_reply(
         else:
             main = f"{period}{overall}，走勢{volatility}" if volatility == "相對穩定" else f"{period}整體{volatility}"
 
-        return f"（趨勢摘要）\n{main}，{recent_phrase}。" if recent_phrase else f"（趨勢摘要）\n{main}。"
+        unit_hint = f"（單位：{unit}）" if unit else ""
+        return (
+            f"（趨勢摘要）\n{main}，{recent_phrase}。{unit_hint}"
+            if recent_phrase
+            else f"（趨勢摘要）\n{main}。{unit_hint}"
+        )
+
+    unit_map: Dict[int, str] = {}
 
     # 年度資料（新到舊）
     for y in sorted(years, reverse=True):
-        ans = year_to_text.get(y)
-        if not ans or ans == DEFAULT_REPLY:
+        e = year_to_entry.get(y)
+        if not e:
             missing.append(y)
             continue
 
+        # 資料來源只取一次：用格式化後的單年度回覆來解析（兼容你原本的來源行格式）
         if not source_url and not source_text:
-            st, su = _extract_source_text_and_url(ans)
+            st, su = _extract_source_text_and_url(_format_answer(e))
             source_text = st
             source_url = su
         elif not source_url:
-            source_url = _extract_first_url(ans)
+            source_url = _extract_first_url(_format_answer(e))
 
-        t = _extract_total_people(ans)
-        if t is not None:
-            totals[y] = t
+        total = _extract_total_value(e.description)
+        unit = (e.unit or "").strip()
+        if not unit:
+            unit = _fallback_extract_unit(e.description)
 
-        lines_out.append(_format_multiyear_line(y, base_topic, t))
+        unit_map[y] = unit
+
+        if total is not None:
+            totals[y] = total
+
+        lines_out.append(_format_multiyear_line(y, base_topic, total, unit))
 
     body = "\n".join(lines_out) if lines_out else "（本次範圍內皆查無符合資料）"
 
@@ -523,12 +584,15 @@ def _format_multiyear_reply(
             body += f"\n{source_url}"
 
     if show_summary and len(totals) >= 2:
-        trend = _trend_sentence_from_totals(years, totals)
+        summary_unit = _pick_summary_unit(years, unit_map)
+        trend = _trend_sentence(years, totals, summary_unit)
         if trend:
             body = f"{body}\n\n{trend}"
 
     if show_summary and len(totals) >= 2:
         ys = sorted(totals.keys())
+        summary_unit = _pick_summary_unit(ys, unit_map)
+
         summary_lines = ["（年度差異摘要）"]
         for i in range(1, len(ys)):
             y1, y2 = ys[i - 1], ys[i]
@@ -536,7 +600,8 @@ def _format_multiyear_reply(
             diff = v2 - v1
             pct = (diff / v1 * 100) if v1 != 0 else 0.0
             sign = "+" if diff >= 0 else ""
-            summary_lines.append(f"{y2}年較{y1}年 {sign}{diff}人（{sign}{pct:.2f}%）")
+            summary_lines.append(f"{y2}年較{y1}年 {sign}{diff}{summary_unit}（{sign}{pct:.2f}%）")
+
         body = f"{body}\n\n" + "\n".join(summary_lines)
 
     return body
@@ -607,12 +672,12 @@ def build_reply(user_text: str) -> str:
         cleaned = _strip_analysis_keywords(text)
         base_topic = strip_year_expression(cleaned)
 
-        year_to_text: Dict[int, Optional[str]] = {}
+        year_to_entry: Dict[int, Optional[Entry]] = {}
         for y in years:
             q = f"{y}年{base_topic}"
-            year_to_text[y] = build_reply_single_year(q)
+            year_to_entry[y] = _get_entry_for_year_query(q)
 
-        reply = _format_multiyear_reply(years, year_to_text, base_topic, show_summary)
+        reply = _format_multiyear_reply(years, year_to_entry, base_topic, show_summary)
         return _append_survey_footer(reply)
 
     # 單年度
