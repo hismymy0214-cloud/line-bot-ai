@@ -31,8 +31,11 @@ MIN_QUERY_LEN = int(os.environ.get("MIN_QUERY_LEN", "8"))
 # 年度差異摘要「開關」關鍵字：只有出現這些字才顯示摘要
 ANALYSIS_KEYWORDS = ["比較", "變化", "異動", "差異", "增減", "趨勢"]
 
+# ===== 查詢結果標頭（你要的）=====
+RESULT_HEADER = "查詢結果如下："
+
 # ===== 滿意度調查（查到/查不到 分流）=====
-SURVEY_URL = os.environ.get("SURVEY_URL", "https://forms.gle/zPaYwuVjrWSnCHdq8")
+SURVEY_URL = os.environ.get("SURVEY_URL", "https://forms.gle/EzvDwUyq5A8sCQrS7")
 
 SURVEY_FOOTER_SUCCESS = (
     "────────────────\n"
@@ -461,7 +464,7 @@ def _format_multiyear_reply(
 
     def _topic_no_suffix(topic: str) -> str:
         t = (topic or "").strip()
-        # 維持你原本習慣：若主題以「人數」結尾，顯示時去掉「人數」
+        # 若主題以「人數」結尾，顯示時去掉「人數」
         if t.endswith("人數"):
             t = t[:-2]
         return t
@@ -473,7 +476,6 @@ def _format_multiyear_reply(
         return f"{year}年{t}總計{total}{unit}"
 
     def _pick_summary_unit(years_sorted: List[int], unit_map: Dict[int, str]) -> str:
-        # 先取最後一年，再往前找（避免最後一年剛好空）
         for y in sorted(years_sorted, reverse=True):
             u = (unit_map.get(y) or "").strip()
             if u:
@@ -543,14 +545,12 @@ def _format_multiyear_reply(
 
     unit_map: Dict[int, str] = {}
 
-    # 年度資料（新到舊）
     for y in sorted(years, reverse=True):
         e = year_to_entry.get(y)
         if not e:
             missing.append(y)
             continue
 
-        # 資料來源只取一次：用格式化後的單年度回覆來解析（兼容你原本的來源行格式）
         if not source_url and not source_text:
             st, su = _extract_source_text_and_url(_format_answer(e))
             source_text = st
@@ -625,7 +625,6 @@ def _is_success_reply(reply: str) -> bool:
     if r == DEFAULT_REPLY:
         return False
 
-    # 引導/提醒/候選（這些都不算「查到資料」）
     if r.startswith("請輸入更完整的查詢關鍵詞"):
         return False
     if r.startswith("看起來您可能少輸入「年度」"):
@@ -633,11 +632,25 @@ def _is_success_reply(reply: str) -> bool:
     if r.startswith("您是不是要找下列資料："):
         return False
 
-    # 多年度全無
     if "（本次範圍內皆查無符合資料）" in r:
         return False
 
     return True
+
+
+def _prepend_result_header(reply: str) -> str:
+    """
+    只有「查到資料」時才加上『查詢結果如下：』，避免干擾引導/候選訊息。
+    且避免重複加標頭。
+    """
+    r = (reply or "").strip()
+    if not r:
+        return r
+    if r.startswith(RESULT_HEADER):
+        return r
+    if _is_success_reply(r):
+        return f"{RESULT_HEADER}\n{r}"
+    return r
 
 
 def _append_survey_footer(reply: str) -> str:
@@ -657,7 +670,10 @@ def build_reply(user_text: str) -> str:
     多年度入口：偵測到「年度範圍」就拆成多筆單年度查詢，最後合併回覆。
     否則走單年度流程。
 
-    最後依「查到/查不到」附上不同滿意度/建議文案。
+    流程：
+    1) 產出 reply
+    2) 若查到資料 → 前置「查詢結果如下：」
+    3) 依查到/查不到 → 附加滿意度問卷 footer
     """
     text = (user_text or "").strip()
     if not text:
@@ -665,7 +681,6 @@ def build_reply(user_text: str) -> str:
 
     years = extract_years(text)
 
-    # 多年度：至少 2 年才進入合併模式
     if len(years) >= 2:
         show_summary = _wants_summary(text)
 
@@ -678,8 +693,9 @@ def build_reply(user_text: str) -> str:
             year_to_entry[y] = _get_entry_for_year_query(q)
 
         reply = _format_multiyear_reply(years, year_to_entry, base_topic, show_summary)
+        reply = _prepend_result_header(reply)
         return _append_survey_footer(reply)
 
-    # 單年度
     reply = build_reply_single_year(text)
+    reply = _prepend_result_header(reply)
     return _append_survey_footer(reply)
