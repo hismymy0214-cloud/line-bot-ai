@@ -31,7 +31,7 @@ MIN_QUERY_LEN = int(os.environ.get("MIN_QUERY_LEN", "8"))
 # 年度差異摘要「開關」關鍵字：只有出現這些字才顯示摘要
 ANALYSIS_KEYWORDS = ["比較", "變化", "異動", "差異", "增減", "趨勢"]
 
-# ===== 查詢結果標頭（你要的）=====
+# ===== 查詢結果標頭 =====
 RESULT_HEADER = "查詢結果如下："
 
 # ===== 滿意度調查（查到/查不到 分流）=====
@@ -161,7 +161,7 @@ class Entry:
     keyword_norm_noyear: str
     year: Optional[str]
     description: str
-    unit: str          # ← 由 training.xlsx 的 unit 欄提供
+    unit: str          # 由 training.xlsx 的 unit 欄提供
     source_url: str
 
 
@@ -309,6 +309,17 @@ def build_reply_single_year(user_text: str) -> str:
     user_norm = _normalize(text)
     user_year = _extract_year(text)
 
+    # C) 少打年度：先提醒補年度（優先於太短引導）
+    if not user_year:
+        ranked_noyear = _rank_matches_noyear(text)
+        if ranked_noyear:
+            best_r2, _, _ = ranked_noyear[0]
+            if best_r2 >= COVERAGE_THRESHOLD:
+                return (
+                    "看起來您可能少輸入「年度」。\n"
+                    "請在問題前面加上年度（例如：113年）再查詢一次。"
+                )
+
     # A) 太短先引導
     if len(user_norm) < MIN_QUERY_LEN:
         return (
@@ -330,17 +341,6 @@ def build_reply_single_year(user_text: str) -> str:
         if best_r >= COVERAGE_THRESHOLD:
             return _format_answer(best_e)
 
-    # C) 少打年度：只提醒補年度（不列候選）
-    if not user_year:
-        ranked_noyear = _rank_matches_noyear(text)
-        if ranked_noyear:
-            best_r2, _, _ = ranked_noyear[0]
-            if best_r2 >= COVERAGE_THRESHOLD:
-                return (
-                    "看起來您可能少輸入「年度」。\n"
-                    "請在問題前面加上年度（例如：113年）再查詢一次。"
-                )
-
     # B) 關鍵詞不夠完整：列出最接近 3 筆（不顯示相符率）
     if ranked:
         best_r, _, _ = ranked[0]
@@ -357,7 +357,7 @@ def build_reply_single_year(user_text: str) -> str:
 
 
 # =========================
-# 多年度專用：取 Entry（不回引導文案）
+# 多年度專用
 # =========================
 def _get_entry_for_year_query(query_text: str) -> Optional[Entry]:
     """
@@ -473,7 +473,8 @@ def _format_multiyear_reply(
         t = _topic_no_suffix(topic)
         if total is None:
             return f"{year}年{t}（查無總計數字）"
-        return f"{year}年{t}總計{total}{unit}"
+        # 2) 多年度數字加千分位
+        return f"{year}年{t}總計{total:,}{unit}"
 
     def _pick_summary_unit(years_sorted: List[int], unit_map: Dict[int, str]) -> str:
         for y in sorted(years_sorted, reverse=True):
@@ -600,7 +601,8 @@ def _format_multiyear_reply(
             diff = v2 - v1
             pct = (diff / v1 * 100) if v1 != 0 else 0.0
             sign = "+" if diff >= 0 else ""
-            summary_lines.append(f"{y2}年較{y1}年 {sign}{diff}{summary_unit}（{sign}{pct:.2f}%）")
+            # 2) 差異摘要 diff 也加千分位
+            summary_lines.append(f"{y2}年較{y1}年 {sign}{diff:,}{summary_unit}（{sign}{pct:.2f}%）")
 
         body = f"{body}\n\n" + "\n".join(summary_lines)
 
