@@ -8,12 +8,6 @@ from collections import Counter
 
 import pandas as pd
 
-# Matplotlib (server-side chart rendering)
-import matplotlib
-matplotlib.use("Agg")  # headless backend
-import matplotlib.pyplot as plt
-
-
 # =========================
 # 設定
 # =========================
@@ -44,7 +38,11 @@ RESULT_HEADER = "查詢結果如下："
 
 # ===== 產生折線圖門檻 =====
 CHART_MIN_YEARS = int(os.environ.get("CHART_MIN_YEARS", "5"))
-CHART_DIR = os.environ.get("CHART_DIR", os.path.join(BASE_DIR, "charts"))
+
+# Render / Linux 上最穩的可寫入位置：/tmp
+# 你仍可用環境變數 CHART_DIR 覆蓋
+CHART_DIR = os.environ.get("CHART_DIR", "/tmp/charts")
+
 # 若你有把 charts 目錄掛到對外靜態站台，可設定此 base url（可選）
 CHART_PUBLIC_BASE_URL = os.environ.get("CHART_PUBLIC_BASE_URL", "").rstrip("/")
 
@@ -452,11 +450,13 @@ def _extract_source_text_and_url(ans_text: str) -> Tuple[str, str]:
     return source_text, source_url
 
 
-def _ensure_chart_dir() -> None:
+def _ensure_chart_dir() -> bool:
     try:
         os.makedirs(CHART_DIR, exist_ok=True)
+        return True
     except Exception as e:
         print(f"[WARN] create chart dir failed: {CHART_DIR} err={e}")
+        return False
 
 
 def draw_line_chart(
@@ -467,15 +467,23 @@ def draw_line_chart(
 ) -> Optional[str]:
     """
     以 matplotlib 產生折線圖 PNG，回傳檔案路徑。
-    - years: X 軸（升冪）
-    - values: Y 軸（同長度）
-    - title: 圖表標題（建議用主題）
-    - unit: 單位（例如：千元/人）
+
+    ⚠️ 為了避免 Render 部署時因為缺 matplotlib 而直接炸掉，
+    本函式採「延遲 import + 失敗就跳過畫圖」，確保 Bot 仍可正常文字回覆。
     """
     if not years or not values or len(years) != len(values):
         return None
 
-    _ensure_chart_dir()
+    if not _ensure_chart_dir():
+        return None
+
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # headless backend（伺服器一定要）
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[WARN] matplotlib not available, skip chart. err={e}")
+        return None
 
     # 產生穩定且不重複的檔名
     payload = f"{years}-{values}-{title}-{unit}-{time.time()}".encode("utf-8")
@@ -507,7 +515,6 @@ def draw_line_chart(
 def _extract_multiyear_series(
     years: List[int],
     year_to_entry: Dict[int, Optional[Entry]],
-    base_topic: str,
 ) -> Tuple[List[int], List[int], str]:
     """
     從 year_to_entry 萃取可畫圖的 (years, totals, unit)：
@@ -531,7 +538,6 @@ def _extract_multiyear_series(
     ys = sorted(totals.keys())
     vs = [totals[y] for y in ys]
 
-    # 選單位：以最新年度為主
     unit = ""
     for y in sorted(unit_map.keys(), reverse=True):
         if unit_map[y]:
@@ -567,7 +573,6 @@ def _format_multiyear_reply(
 
     def _topic_no_suffix(topic: str) -> str:
         t = (topic or "").strip()
-        # 若主題以「人數」結尾，顯示時去掉「人數」
         if t.endswith("人數"):
             t = t[:-2]
         return t
@@ -576,7 +581,6 @@ def _format_multiyear_reply(
         t = _topic_no_suffix(topic)
         if total is None:
             return f"{year}年{t}（查無總計數字）"
-        # 多年度數字加千分位
         return f"{year}年{t}總計{total:,}{unit}"
 
     def _pick_summary_unit(years_sorted: List[int], unit_map: Dict[int, str]) -> str:
@@ -663,10 +667,7 @@ def _format_multiyear_reply(
             source_url = _extract_first_url(_format_answer(e))
 
         total = _extract_total_value(e.description)
-        unit = (e.unit or "").strip()
-        if not unit:
-            unit = _fallback_extract_unit(e.description)
-
+        unit = (e.unit or "").strip() or _fallback_extract_unit(e.description)
         unit_map[y] = unit
 
         if total is not None:
@@ -711,42 +712,24 @@ def _format_multiyear_reply(
     return body
 
 
-# =========================
-# footer 分流：查到 / 查不到
-# =========================
 def _is_success_reply(reply: str) -> bool:
-    """
-    判斷「是否查到資料」：
-    - DEFAULT_REPLY -> 失敗
-    - 引導/提醒/候選 -> 視為未查到（使用 fallback 文案）
-    - 多年度全無 -> 視為未查到
-    - 其餘 -> 視為查到（使用 success 文案）
-    """
     r = (reply or "").strip()
     if not r:
         return False
-
     if r == DEFAULT_REPLY:
         return False
-
     if r.startswith("請輸入更完整的查詢關鍵詞"):
         return False
     if r.startswith("看起來您可能少輸入「年度」"):
         return False
     if r.startswith("您是不是要找下列資料："):
         return False
-
     if "（本次範圍內皆查無符合資料）" in r:
         return False
-
     return True
 
 
 def _prepend_result_header(reply: str) -> str:
-    """
-    只有「查到資料」時才加上『查詢結果如下：』，避免干擾引導/候選訊息。
-    且避免重複加標頭。
-    """
     r = (reply or "").strip()
     if not r:
         return r
@@ -758,13 +741,9 @@ def _prepend_result_header(reply: str) -> str:
 
 
 def _append_survey_footer(reply: str) -> str:
-    """
-    依「查到/查不到」附上不同文案（避免重複附加）。
-    """
     r = (reply or "").rstrip()
     if SURVEY_URL in r:
-        return r  # 已附過就不再附
-
+        return r
     footer = SURVEY_FOOTER_SUCCESS if _is_success_reply(r) else SURVEY_FOOTER_FALLBACK
     return f"{r.rstrip()}\n{footer}" if r else footer
 
@@ -775,9 +754,8 @@ def build_reply(user_text: str) -> str:
     否則走單年度流程。
 
     折線圖規則：
-    - 多年度 years >= CHART_MIN_YEARS 才會產生折線圖檔（PNG）
-    - 本模組仍回傳「文字」；圖檔路徑/連結會附在文字中
-      （你在 Flask/LINE handler 可改為：偵測到路徑後再送 image message）
+    - 多年度 years >= CHART_MIN_YEARS 才會嘗試產生折線圖（PNG）
+    - 即使 matplotlib 缺失/畫圖失敗，也不影響文字回覆（只會跳過）
     """
     text = (user_text or "").strip()
     if not text:
@@ -800,12 +778,10 @@ def build_reply(user_text: str) -> str:
 
         # ===== 產生折線圖（>=5 年才畫）=====
         if len(years) >= CHART_MIN_YEARS:
-            xs, ys, unit = _extract_multiyear_series(years, year_to_entry, base_topic)
-            # 至少要有 2 點才有線
+            xs, vs, unit = _extract_multiyear_series(years, year_to_entry)
             if len(xs) >= 2:
-                chart_path = draw_line_chart(xs, ys, title=f"{xs[0]}–{xs[-1]}年 {base_topic}", unit=unit)
+                chart_path = draw_line_chart(xs, vs, title=f"{xs[0]}–{xs[-1]}年 {base_topic}", unit=unit)
                 if chart_path:
-                    # 若有對外靜態網址，提供網址；否則提供檔案路徑（給後端轉 image message 用）
                     if CHART_PUBLIC_BASE_URL:
                         public_url = f"{CHART_PUBLIC_BASE_URL}/{os.path.basename(chart_path)}"
                         reply += f"\n\n（折線圖）\n{public_url}"
