@@ -1,10 +1,18 @@
 import os
 import re
+import time
+import hashlib
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from collections import Counter
 
 import pandas as pd
+
+# Matplotlib (server-side chart rendering)
+import matplotlib
+matplotlib.use("Agg")  # headless backend
+import matplotlib.pyplot as plt
+
 
 # =========================
 # 設定
@@ -33,6 +41,12 @@ ANALYSIS_KEYWORDS = ["比較", "變化", "異動", "差異", "增減", "趨勢"]
 
 # ===== 查詢結果標頭 =====
 RESULT_HEADER = "查詢結果如下："
+
+# ===== 產生折線圖門檻 =====
+CHART_MIN_YEARS = int(os.environ.get("CHART_MIN_YEARS", "5"))
+CHART_DIR = os.environ.get("CHART_DIR", os.path.join(BASE_DIR, "charts"))
+# 若你有把 charts 目錄掛到對外靜態站台，可設定此 base url（可選）
+CHART_PUBLIC_BASE_URL = os.environ.get("CHART_PUBLIC_BASE_URL", "").rstrip("/")
 
 # ===== 滿意度調查（查到/查不到 分流）=====
 SURVEY_URL = os.environ.get("SURVEY_URL", "https://forms.gle/EzvDwUyq5A8sCQrS7")
@@ -203,7 +217,7 @@ def _load_training() -> None:
     kw_col = colmap["keywords"]
     desc_col = colmap["description"]
     src_col = colmap["source_url"]
-    unit_col = colmap.get("unit")  # unit 欄可有可無
+    unit_col = colmap.get("unit")  # unit 欄可有可無（新增分類欄也不影響）
 
     exact_map: Dict[str, Entry] = {}
     entries: List[Entry] = []
@@ -438,6 +452,95 @@ def _extract_source_text_and_url(ans_text: str) -> Tuple[str, str]:
     return source_text, source_url
 
 
+def _ensure_chart_dir() -> None:
+    try:
+        os.makedirs(CHART_DIR, exist_ok=True)
+    except Exception as e:
+        print(f"[WARN] create chart dir failed: {CHART_DIR} err={e}")
+
+
+def draw_line_chart(
+    years: List[int],
+    values: List[int],
+    title: str,
+    unit: str = "",
+) -> Optional[str]:
+    """
+    以 matplotlib 產生折線圖 PNG，回傳檔案路徑。
+    - years: X 軸（升冪）
+    - values: Y 軸（同長度）
+    - title: 圖表標題（建議用主題）
+    - unit: 單位（例如：千元/人）
+    """
+    if not years or not values or len(years) != len(values):
+        return None
+
+    _ensure_chart_dir()
+
+    # 產生穩定且不重複的檔名
+    payload = f"{years}-{values}-{title}-{unit}-{time.time()}".encode("utf-8")
+    h = hashlib.sha1(payload).hexdigest()[:12]
+    filename = f"trend_{years[0]}_{years[-1]}_{h}.png"
+    out_path = os.path.join(CHART_DIR, filename)
+
+    try:
+        plt.figure()
+        plt.plot(years, values, marker="o")
+        plt.title(title if title else "趨勢折線圖")
+        plt.xlabel("年度")
+        plt.ylabel(f"數值{f'（{unit}）' if unit else ''}")
+        plt.xticks(years)
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=180)
+        plt.close()
+        return out_path
+    except Exception as e:
+        print(f"[WARN] draw chart failed: {e}")
+        try:
+            plt.close()
+        except Exception:
+            pass
+        return None
+
+
+def _extract_multiyear_series(
+    years: List[int],
+    year_to_entry: Dict[int, Optional[Entry]],
+    base_topic: str,
+) -> Tuple[List[int], List[int], str]:
+    """
+    從 year_to_entry 萃取可畫圖的 (years, totals, unit)：
+    - 只取有抓到總計數字者
+    - unit 優先取最新年度的 unit（若空則從 description fallback）
+    """
+    totals: Dict[int, int] = {}
+    unit_map: Dict[int, str] = {}
+
+    for y in years:
+        e = year_to_entry.get(y)
+        if not e:
+            continue
+        total = _extract_total_value(e.description)
+        if total is None:
+            continue
+        unit = (e.unit or "").strip() or _fallback_extract_unit(e.description)
+        totals[y] = total
+        unit_map[y] = unit
+
+    ys = sorted(totals.keys())
+    vs = [totals[y] for y in ys]
+
+    # 選單位：以最新年度為主
+    unit = ""
+    for y in sorted(unit_map.keys(), reverse=True):
+        if unit_map[y]:
+            unit = unit_map[y]
+            break
+
+    return ys, vs, unit
+
+
 def _format_multiyear_reply(
     years: List[int],
     year_to_entry: Dict[int, Optional[Entry]],
@@ -473,7 +576,7 @@ def _format_multiyear_reply(
         t = _topic_no_suffix(topic)
         if total is None:
             return f"{year}年{t}（查無總計數字）"
-        # 2) 多年度數字加千分位
+        # 多年度數字加千分位
         return f"{year}年{t}總計{total:,}{unit}"
 
     def _pick_summary_unit(years_sorted: List[int], unit_map: Dict[int, str]) -> str:
@@ -601,7 +704,6 @@ def _format_multiyear_reply(
             diff = v2 - v1
             pct = (diff / v1 * 100) if v1 != 0 else 0.0
             sign = "+" if diff >= 0 else ""
-            # 2) 差異摘要 diff 也加千分位
             summary_lines.append(f"{y2}年較{y1}年 {sign}{diff:,}{summary_unit}（{sign}{pct:.2f}%）")
 
         body = f"{body}\n\n" + "\n".join(summary_lines)
@@ -672,10 +774,10 @@ def build_reply(user_text: str) -> str:
     多年度入口：偵測到「年度範圍」就拆成多筆單年度查詢，最後合併回覆。
     否則走單年度流程。
 
-    流程：
-    1) 產出 reply
-    2) 若查到資料 → 前置「查詢結果如下：」
-    3) 依查到/查不到 → 附加滿意度問卷 footer
+    折線圖規則：
+    - 多年度 years >= CHART_MIN_YEARS 才會產生折線圖檔（PNG）
+    - 本模組仍回傳「文字」；圖檔路徑/連結會附在文字中
+      （你在 Flask/LINE handler 可改為：偵測到路徑後再送 image message）
     """
     text = (user_text or "").strip()
     if not text:
@@ -695,6 +797,21 @@ def build_reply(user_text: str) -> str:
             year_to_entry[y] = _get_entry_for_year_query(q)
 
         reply = _format_multiyear_reply(years, year_to_entry, base_topic, show_summary)
+
+        # ===== 產生折線圖（>=5 年才畫）=====
+        if len(years) >= CHART_MIN_YEARS:
+            xs, ys, unit = _extract_multiyear_series(years, year_to_entry, base_topic)
+            # 至少要有 2 點才有線
+            if len(xs) >= 2:
+                chart_path = draw_line_chart(xs, ys, title=f"{xs[0]}–{xs[-1]}年 {base_topic}", unit=unit)
+                if chart_path:
+                    # 若有對外靜態網址，提供網址；否則提供檔案路徑（給後端轉 image message 用）
+                    if CHART_PUBLIC_BASE_URL:
+                        public_url = f"{CHART_PUBLIC_BASE_URL}/{os.path.basename(chart_path)}"
+                        reply += f"\n\n（折線圖）\n{public_url}"
+                    else:
+                        reply += f"\n\n（折線圖已產生）\n{chart_path}"
+
         reply = _prepend_result_header(reply)
         return _append_survey_footer(reply)
 
