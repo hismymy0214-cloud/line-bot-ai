@@ -35,23 +35,11 @@ ANALYSIS_KEYWORDS = ["比較", "變化", "異動", "差異", "增減", "趨勢"]
 RESULT_HEADER = "查詢結果如下："
 
 # ===== 滿意度調查（查到/查不到 分流）=====
-SURVEY_URL = os.environ.get("SURVEY_URL", "https://forms.gle/EzvDwUyq5A8sCQrS7")
+SURVEY_URL = os.environ.get("SURVEY_URL", "")  # 留空=不在回覆中顯示（建議改用圖文選單）
 
-SURVEY_FOOTER_SUCCESS = (
-    "────────────────\n"
-    "📊 滿意度調查（約 30 秒）\n"
-    "為持續精進「AI 工務局主計問答系統」，誠摯邀請您填寫使用體驗回饋與建議：\n"
-    f"👉 {SURVEY_URL}\n"
-    "（本問卷不蒐集個人資料，僅作系統改善參考，感謝您的協助）"
-)
+SURVEY_FOOTER_SUCCESS = ""
 
-SURVEY_FOOTER_FALLBACK = (
-    "────────────────\n"
-    "📝 回饋與建議\n"
-    "若本系統回覆不符合您的查詢需求，可否協助提供您寶貴的建議事項，"
-    "作為本系統後續精進與資料更新之參考：\n"
-    f"👉 {SURVEY_URL}"
-)
+SURVEY_FOOTER_FALLBACK = ""
 
 # 額外：常見同義/寫法修正（可再擴充）
 _REPLACEMENTS = [
@@ -171,11 +159,9 @@ _ENTRIES: List[Entry] = []
 
 def _format_answer(entry: Entry) -> str:
     """
-    LINE 不支援 markdown hyperlink，但會把純網址自動轉成可點連結，
-    所以用「內容 + 換行 + URL」最穩。
+    回覆內容僅回傳 description（不在訊息中顯示連結），
+    以免佔用 LINE 版面；連結建議集中於圖文選單。
     """
-    if entry.source_url:
-        return f"{entry.description}\n{entry.source_url}"
     return entry.description
 
 
@@ -576,13 +562,7 @@ def _format_multiyear_reply(
     if missing:
         miss = "、".join([f"{m}年" for m in sorted(missing, reverse=True)])
         body = f"{body}\n\n（查無資料年度：{miss}）"
-
-    if source_text or source_url:
-        body = f"{body}\n\n（資料來源）"
-        if source_text:
-            body += f"\n{source_text}"
-        if source_url:
-            body += f"\n{source_url}"
+    # （資料來源）連結不在回覆中顯示：已移至圖文選單
 
     if show_summary and len(totals) >= 2:
         summary_unit = _pick_summary_unit(years, unit_map)
@@ -657,14 +637,10 @@ def _prepend_result_header(reply: str) -> str:
 
 def _append_survey_footer(reply: str) -> str:
     """
-    依「查到/查不到」附上不同文案（避免重複附加）。
+    版面精簡：不在回覆中附加「滿意度調查/回饋連結」。
+    建議改由圖文選單提供「滿意度調查」「意見回饋」「資料來源」等入口。
     """
-    r = (reply or "").rstrip()
-    if SURVEY_URL in r:
-        return r  # 已附過就不再附
-
-    footer = SURVEY_FOOTER_SUCCESS if _is_success_reply(r) else SURVEY_FOOTER_FALLBACK
-    return f"{r.rstrip()}\n{footer}" if r else footer
+    return (reply or "").rstrip()
 
 
 def build_reply(user_text: str) -> str:
