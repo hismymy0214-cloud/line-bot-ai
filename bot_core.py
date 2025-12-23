@@ -195,7 +195,7 @@ _CHANGE_AVAILABLE: bool = False
 
 
 def _format_answer(entry: Entry) -> str:
-    """
+     """
     組合回覆內容：
       - 主內容：description（若含「資料來源」區塊，會先拆出主內容）
       - 資料來源：優先取 description 內的來源；若抓不到或為空，改用 source_url 欄位
@@ -209,14 +209,15 @@ def _format_answer(entry: Entry) -> str:
         src = _clean_source_name(entry.source_url or "")
 
     head = (head or "").strip()
+
+    # 三種情況：有主文+來源 / 只有主文 / 只有來源
+    if head and src:
+        return f"{head}\n\n（資料來源）\n{src}"
+    if head:
+        return head
     if src:
-        return f"{head}
-（資料來源）
-{src}" if head else f"（資料來源）
-{src}"
-    return head
-
-
+        return f"（資料來源）\n{src}"
+    return ""
 
 def _split_desc_and_source(description: str) -> tuple[str, str]:
     """將 description 拆成：主內容、資料來源(若有)。
