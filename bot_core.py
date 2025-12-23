@@ -195,11 +195,27 @@ _CHANGE_AVAILABLE: bool = False
 
 
 def _format_answer(entry: Entry) -> str:
-    """回覆內容：
-    - 以 description 為主
-    - 若 description 未含資料來源，則以 source_url 欄位補上（避免回覆沒有來源）
     """
-    return _merge_desc_with_source(entry.description, entry.source_url)
+    組合回覆內容：
+      - 主內容：description（若含「資料來源」區塊，會先拆出主內容）
+      - 資料來源：優先取 description 內的來源；若抓不到或為空，改用 source_url 欄位
+    """
+    desc = (entry.description or "").strip()
+    head, src_in_desc = _split_desc_and_source(desc)
+
+    # 來源：先用 description 解析到的，再 fallback 到欄位 source_url
+    src = _clean_source_name(src_in_desc)
+    if not src:
+        src = _clean_source_name(entry.source_url or "")
+
+    head = (head or "").strip()
+    if src:
+        return f"{head}
+（資料來源）
+{src}" if head else f"（資料來源）
+{src}"
+    return head
+
 
 
 def _split_desc_and_source(description: str) -> tuple[str, str]:
@@ -253,40 +269,25 @@ def _split_desc_and_source(description: str) -> tuple[str, str]:
 
 def _clean_source_name(source_text: str) -> str:
     """清理來源文字（避免來源欄位本身已含『資料來源』字樣造成重覆）。"""
-    if not source_text:
+    if source_text is None:
         return ""
-    head, src = _split_desc_and_source(str(source_text))
-    # 若 split 有抓到來源，優先用來源；否則用原文字
-    return (src or head or "").strip()
+    # 避免 Excel NaN 變成字串 'nan'
+    t0 = str(source_text).strip()
+    if not t0 or t0.lower() == "nan":
+        return ""
 
+    head, src = _split_desc_and_source(t0)
+    cand = (src or head or "").strip()
 
-def _merge_desc_with_source(description: str, fallback_source: str) -> str:
-    """確保回覆中會顯示『資料來源』：
-    - 先從 description 解析（允許『（資料來源）』各種寫法）
-    - 若 description 沒有來源或來源空白，改用 fallback_source（通常取自 source_url 欄）
-    - 會避免只出現『（資料來源）』但沒有內容的情況
-    """
-    desc = (description or "").strip()
-    fb = (fallback_source or "").strip()
+    # 避免把單獨括號當成來源（你目前看到的多一個『）』就是這種情況）
+    if cand in {")", "）", "(", "（"}:
+        return ""
 
-    if not desc:
-        return f"（資料來源）\n{fb}" if fb else ""
+    # 有時來源只剩符號/括號，直接視為空
+    if re.fullmatch(r"[()（）\[\]【】\s]+", cand or ""):
+        return ""
 
-    head, src = _split_desc_and_source(desc)
-    src = (src or "").strip()
-
-    # 若描述內已有來源就用它；否則用 fallback
-    final_src = src if src else fb
-
-    head_final = head.strip() if head is not None else ""
-
-    if final_src:
-        if head_final:
-            return f"{head_final}\n\n（資料來源）\n{final_src}"
-        return f"（資料來源）\n{final_src}"
-
-    # 沒有任何來源可用：回傳原文（去除多餘空白）
-    return head_final if head_final else desc
+    return cand
 
 
 def _safe_int(s: str) -> Optional[int]:
@@ -810,11 +811,9 @@ def _get_value_for_year_topic(year: int, topic: str) -> Tuple[Optional[int], str
         return None, "", ""
     total = _extract_total_value(e.description)
     unit = (e.unit or "").strip() or _fallback_extract_unit(e.description)
-    # 嘗試抓資料來源文字（沒有就回退到 source_url 欄）
-    head, src_in_desc = _split_desc_and_source(e.description)
-    source_name = _clean_source_name(src_in_desc)
-    if not source_name:
-        source_name = (e.source_url or "").strip()
+    # 嘗試抓資料來源文字（沒有就留空）
+    source_text, _ = _extract_source_text_and_url(e.description)
+    source_name = source_text.strip()
     return total, unit, source_name
 
 
@@ -848,7 +847,7 @@ def _format_change_reply(user_text: str) -> str:
     unit = (unit_now or unit_prev or "").strip()
 
     # 資料來源：以當年度優先
-    source_name = _clean_source_name((src_now or src_prev or "").strip())
+    source_name = (src_now or src_prev or "").strip()
 
     # 若任一年度查不到
     if v_now is None and v_prev is None:
@@ -863,23 +862,17 @@ def _format_change_reply(user_text: str) -> str:
     diff_abs = abs(diff)
 
     pct = (diff / v_prev * 100.0) if v_prev != 0 else 0.0
-    pct_sign = "+" if pct >= 0 else ""    # 顯示主題：維持使用者題目中的主題（通常會包含「人數/金額」等字眼）
-    topic_display = topic.strip()
+    pct_sign = "+" if pct >= 0 else ""
 
-    # 兩個年度的原始值都列出（皆優先取自「變動」工作表）
-    line_now = f"{year}年{topic_display}{v_now:,}{unit}。"
-    line_prev = f"{prev}年{topic_display}{v_prev:,}{unit}。"
+    # 顯示主題：若以「人數」結尾，回覆上更順（職員總計...）
+    topic_display = topic
+    if topic_display.endswith("人數"):
+        topic_display = topic_display[:-2]
 
-    diff = v_now - v_prev
-    sign = "增加" if diff > 0 else ("減少" if diff < 0 else "持平")
-    diff_abs = abs(diff)
-
-    pct = (diff / v_prev * 100.0) if v_prev != 0 else 0.0
-
-    # 例：113年較112年增加5人（0.96%）
-    line_diff = f"{year}年較{prev}年{sign}{diff_abs:,}{unit}（{pct:.2f}%）。"
-
-    lines = [line_now, line_prev, line_diff]
+    lines = [
+        f"{year}年{topic_display}總計{v_now:,}{unit}。",
+        f"{year}年較{prev}年{sign}{diff_abs:,}{unit}（{pct_sign}{pct:.2f}%）。",
+    ]
 
     if source_name:
         lines.append("（資料來源）")
