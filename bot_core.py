@@ -202,6 +202,63 @@ def _format_answer(entry: Entry) -> str:
     return entry.description
 
 
+def _split_desc_and_source(description: str) -> tuple[str, str]:
+    """將 description 拆成：主內容、資料來源(若有)。
+    允許以下型態：
+    - （資料來源）\nXXX
+    - (資料來源)\nXXX
+    - 資料來源：XXX
+    - （資料來源） XXX
+    """
+    if not description:
+        return "", ""
+    text = str(description).replace("\r\n", "\n").replace("\r", "\n")
+    lines = [ln.rstrip() for ln in text.split("\n")]
+
+    # 1) 逐行找「資料來源」標記
+    marker_idx = None
+    for i, ln in enumerate(lines):
+        t = ln.strip()
+        if not t:
+            continue
+        if "資料來源" in t:
+            # 優先辨識像「（資料來源）」這種單行 marker
+            # 或「資料來源：」在同一行後面有來源
+            marker_idx = i
+            break
+
+    if marker_idx is None:
+        return text.strip(), ""
+
+    head = "\n".join(lines[:marker_idx]).strip()
+
+    marker_line = lines[marker_idx].strip()
+
+    # 2) 同一行就帶來源，例如：資料來源：XXX / （資料來源）XXX
+    m = re.search(r"資料來源[）)】\]:：\s]*\s*(.+)$", marker_line)
+    if m and m.group(1).strip():
+        src = m.group(1).strip()
+        return head, src
+
+    # 3) 來源在下一行（取第一個非空行）
+    src = ""
+    for j in range(marker_idx + 1, len(lines)):
+        t = lines[j].strip()
+        if t:
+            src = t
+            break
+
+    return head, src
+
+
+def _clean_source_name(source_text: str) -> str:
+    """清理來源文字（避免來源欄位本身已含『資料來源』字樣造成重覆）。"""
+    if not source_text:
+        return ""
+    head, src = _split_desc_and_source(str(source_text))
+    # 若 split 有抓到來源，優先用來源；否則用原文字
+    return (src or head or "").strip()
+
 def _safe_int(s: str) -> Optional[int]:
     if s is None:
         return None
@@ -651,6 +708,26 @@ def _format_multiyear_reply(
 
         body = f"{body}\n\n" + "\n".join(summary_lines)
 
+    # 補上資料來源（多年度系列只顯示一次，優先取最新年度）
+    source_name = ""
+    for y in sorted(years, reverse=True):
+        e = year_to_entry.get(y)
+        if not e:
+            continue
+        # 先從 description 解析
+        src_text, _ = _extract_source_text_and_url(e.description)
+        source_name = _clean_source_name(src_text)
+        if source_name:
+            break
+        # 若 description 沒有，嘗試用 split（兼容『（資料來源）XXX』同一行）
+        _, src2 = _split_desc_and_source(e.description)
+        source_name = _clean_source_name(src2)
+        if source_name:
+            break
+
+    if source_name:
+        body = f"{body}\n\n（資料來源）\n{source_name}"
+
     return body
 
 
@@ -693,7 +770,7 @@ def _get_value_for_year_topic(year: int, topic: str) -> Tuple[Optional[int], str
         best_r, _, best = ranked[0]
         if best_r >= COVERAGE_THRESHOLD and best.value is not None:
             unit = (best.unit or "").strip()
-            source_name = (best.source_url_name or "").strip()
+            source_name = _clean_source_name((best.source_url_name or "").strip())
             return best.value, unit, source_name
 
     # 2) 回退：Sheet1
