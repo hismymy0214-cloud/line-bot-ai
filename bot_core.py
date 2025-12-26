@@ -290,6 +290,7 @@ def _format_change_reply(text: str) -> str:
 
     lines = [
         f"{year}年{topic}總計{cur.value:,}{cur.unit}。",
+	f"{year-1}年{topic}總計{prev.value:,}{cur.unit}。",
         f"{year}年較{year-1}年{sign}{abs(diff):,}{cur.unit}（{pct:+.2f}%）。",
     ]
 
