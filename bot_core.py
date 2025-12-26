@@ -295,7 +295,6 @@ def _format_change_reply(text: str) -> str:
 
     src = _clean_source(cur.source_name)
     if src:
-        lines.append("（資料來源）")
         lines.append(src)
 
     return "\n".join(lines)
