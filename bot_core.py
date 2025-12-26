@@ -243,11 +243,11 @@ def _format_answer(entry: Entry) -> str:
     head = head.strip()
 
     if head and src:
-        return f"{head}\n\n（資料來源）\n{src}"
+        return f"{head}\n\n資料來源：\n{src}"
     if head:
         return head
     if src:
-        return f"（資料來源）\n{src}"
+        return f"資料來源：\n{src}"
     return ""
 
 
