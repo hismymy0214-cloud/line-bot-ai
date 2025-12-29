@@ -42,6 +42,13 @@ CHANGE_TIME_KEYWORDS = [
     "去年",
     "上年度",
     "上一年度",
+    "較上一年",
+    "較上年",
+    "比上一年",
+    "比上年",
+    "前一年",
+    "上一年",
+
 ]
 
 CHANGE_ACTION_KEYWORDS = [
@@ -50,11 +57,7 @@ CHANGE_ACTION_KEYWORDS = [
     "增減",
     "差額",
     "差距",
-    "成長",
-    "增加",
-    "減少",
-    "上升",
-    "下降",
+    "變化",
 ]
 
 ALLOW_ACTION_ONLY_CHANGE = False
