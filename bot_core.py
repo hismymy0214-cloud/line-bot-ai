@@ -2,11 +2,12 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+from collections import Counter
 
 import pandas as pd
 
 # =========================
-# 基本設定
+# 設定
 # =========================
 DEFAULT_REPLY = "抱歉，該訓練檔找不到符合的資料，請重新輸入或換個說法喔。"
 
@@ -14,391 +15,1125 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.environ.get("TRAINING_FILE", "training.xlsx")
 DATA_PATH = os.path.join(BASE_DIR, DATA_FILE)
 
-COVERAGE_THRESHOLD = 0.8
-SUGGEST_THRESHOLD = 0.6
-SUGGEST_TOPN = 3
+# 覆蓋率門檻：keywords 至少 80% 被使用者輸入「涵蓋」才算命中
+COVERAGE_THRESHOLD = float(os.environ.get("COVERAGE_THRESHOLD", "0.8"))
 
-# 多年度（區間）最多支援 5 年（含）
-MAX_MULTIYEAR = 5
+# 接近門檻：>= 0.6 且 < 0.8 時，回候選提示
+SUGGEST_THRESHOLD = float(os.environ.get("SUGGEST_THRESHOLD", "0.6"))
+SUGGEST_TOPN = int(os.environ.get("SUGGEST_TOPN", "3"))
 
-MIN_QUERY_LEN = 8
+# 多年度最多允許查詢多少年（避免有人輸入 80-120 年把 Bot 打爆）
+MAX_YEAR_SPAN = int(os.environ.get("MAX_YEAR_SPAN", "10"))
+
+# 輸入太短時先引導
+MIN_QUERY_LEN = int(os.environ.get("MIN_QUERY_LEN", "8"))
+
+# 年度差異摘要「開關」關鍵字：只有出現這些字才顯示摘要
+ANALYSIS_KEYWORDS = ["比較", "變化", "異動", "差異", "增減", "趨勢"]
+
+# ===== 查詢結果標頭 =====
 RESULT_HEADER = "查詢結果如下："
 
-_YEAR_RE = re.compile(r"(\d{3})\s*年?")
+# 版面精簡：回覆中不顯示滿意度/資料來源連結（請改放圖文選單）
+SURVEY_URL = os.environ.get("SURVEY_URL", "")  # 保留環境變數，相容舊版
+SURVEY_FOOTER_SUCCESS = ""
+SURVEY_FOOTER_FALLBACK = ""
 
-# 多年度區間：109-113 / 109~113 / 109至113 / 109到113
-_YEAR_RANGE_RE = re.compile(r"(?P<y1>\d{3})\s*(?:[-~－—]|至|到)\s*(?P<y2>\d{3})\s*年?")
-
-# =========================
-# 「較上一年度變動」觸發規則（可擴充）
-# =========================
-CHANGE_TIME_KEYWORDS = [
-    "較上一年度",
-    "較上年度",
-    "比上一年度",
-    "比上年度",
-    "前一年度",
-    "前年度",
-    "去年",
-    "上年度",
-    "上一年度",
-    "較上一年",
-    "較上年",
-    "比上一年",
-    "比上年",
-    "前一年",
-    "上一年",
-
+# 額外：常見同義/寫法修正（可再擴充）
+_REPLACEMENTS = [
+    ("年度", "年"),
+    ("年 度", "年"),
+    ("　", ""),  # 全形空白
 ]
 
-CHANGE_ACTION_KEYWORDS = [
-    "變動",
-    "異動",
-    "增減",
-    "差額",
-    "差距",
-    "變化",
-]
+_PUNCT_RE = re.compile(r"[，,。．、\s]+")
+_YEAR_RE = re.compile(r"(?P<y>\d{3})\s*年")
 
-ALLOW_ACTION_ONLY_CHANGE = False
+# 「較上年度 / 較上一年度 / 比上年度 / 比上一年度 / 較前一年度...」等語句
+_CHANGE_RE = re.compile(r"(較|比)\s*(上|前)\s*(一)?\s*(年度|年|期)?")
+_CHANGE_WORDS = ["較上", "較上一", "比上", "比上一", "較前", "比前", "差額", "差距", "變動", "增減", "較去年", "比去年"]
 
 
-# =========================
-# 工具函式
-# =========================
+def _wants_summary(user_text: str) -> bool:
+    """輸入含「比較/變化/異動...」才顯示年度差異摘要（含趨勢一句話）。"""
+    t = str(user_text or "")
+    return any(k in t for k in ANALYSIS_KEYWORDS)
+
+
+def _strip_analysis_keywords(text: str) -> str:
+    """把『比較/變化/異動...』等分析詞從查詢中移除，避免影響題庫匹配。"""
+    t = str(text or "")
+    for k in ANALYSIS_KEYWORDS:
+        t = t.replace(k, "")
+    return t.strip()
+
+
 def _normalize(text: str) -> str:
-    if not text:
+    if text is None:
         return ""
-    return re.sub(r"[，,。．、\s]+", "", text.strip())
+    t = str(text).strip()
+    for a, b in _REPLACEMENTS:
+        t = t.replace(a, b)
+    t = _PUNCT_RE.sub("", t)
+    return t
 
 
-def _extract_year(text: str) -> Optional[int]:
-    m = _YEAR_RE.search(text or "")
-    return int(m.group(1)) if m else None
+def _extract_year(text: str) -> Optional[str]:
+    """抓第一個年度（113年 / 113）"""
+    m = _YEAR_RE.search(str(text or ""))
+    if m:
+        return m.group("y")
+    m2 = re.search(r"(?P<y>\d{3})", str(text or ""))
+    return m2.group("y") if m2 else None
 
 
-def _extract_year_range(text: str) -> Optional[List[int]]:
+def _strip_year(text_norm: str) -> str:
+    t = _YEAR_RE.sub("", text_norm)
+    t = re.sub(r"\d{3}", "", t)
+    return t
+
+
+def extract_years(text: str) -> List[int]:
     """
-    解析多年度區間（最多 MAX_MULTIYEAR 年）：
-      109-113年 / 109~113年 / 109至113年 / 109到113年
-    回傳升冪年份清單，例如 [109,110,111,112,113]
-    不是區間則回 None
+    支援多年度輸入：
+      - 112-113年
+      - 112~113年
+      - 112至113年 / 112到113年
+      - 112,113年 / 112、113年（會取出所有三位數年度）
+    回傳：升冪年份清單，例如 [112, 113]
     """
-    m = _YEAR_RANGE_RE.search(text or "")
+    s = str(text or "")
+
+    # 1) 範圍（含「年」或不含都可）
+    m = re.search(r"(\d{3})\s*[-~－—]\s*(\d{3})\s*年?", s)
     if not m:
-        return None
+        m = re.search(r"(\d{3})\s*(?:至|到)\s*(\d{3})\s*年?", s)
 
-    y1 = int(m.group("y1"))
-    y2 = int(m.group("y2"))
-    lo, hi = (y1, y2) if y1 <= y2 else (y2, y1)
+    if m:
+        y1, y2 = int(m.group(1)), int(m.group(2))
+        lo, hi = min(y1, y2), max(y1, y2)
+        span = hi - lo + 1
+        if span > MAX_YEAR_SPAN:
+            return []
+        return list(range(lo, hi + 1))
 
-    years = list(range(lo, hi + 1))
-    if len(years) > MAX_MULTIYEAR:
-        return ["__TOO_LONG__"]  # type: ignore
-    return years
+    # 2) 非範圍：抓出所有三位數年度（去重）
+    years = re.findall(r"(\d{3})\s*年?", s)
+    if years:
+        uniq = sorted({int(y) for y in years})
+        return uniq
+
+    return []
 
 
-def _strip_year_range(text: str) -> str:
-    """移除區間年度表達，留下主題。"""
-    return _YEAR_RANGE_RE.sub("", text or "").strip()
+def strip_year_expression(text: str) -> str:
+    """
+    把文字中的「年度表達」移除，留下「主題」：
+      112-113年工務局暨所屬職員人數 -> 工務局暨所屬職員人數
+    """
+    s = str(text or "")
+
+    # 先去掉範圍
+    s = re.sub(r"\d{3}\s*[-~－—]\s*\d{3}\s*年?", "", s)
+    s = re.sub(r"\d{3}\s*(?:至|到)\s*\d{3}\s*年?", "", s)
+
+    # 再去掉單一年（避免殘留）
+    s = re.sub(r"\d{3}\s*年", "", s)
+    s = re.sub(r"\d{3}", "", s)
+
+    return s.strip()
 
 
 def _is_change_query(text: str) -> bool:
-    """
-    判斷是否為「較上一年度變動」類查詢。
-    規則（預設較安全）：
-      - 同時包含「時間比較」關鍵字 + 「變動行為」關鍵字
-    """
-    if not text:
-        return False
-
-    t = str(text)
-    has_time = any(k in t for k in CHANGE_TIME_KEYWORDS)
-    has_action = any(k in t for k in CHANGE_ACTION_KEYWORDS)
-
-    if has_time and has_action:
+    """偵測『較上年度/較上一年度/變動/差額』等需求。"""
+    t = str(text or "")
+    if _CHANGE_RE.search(t):
         return True
-
-    if ALLOW_ACTION_ONLY_CHANGE and has_action:
-        return True
-
-    return False
+    return any(w in t for w in _CHANGE_WORDS)
 
 
-def _split_desc_and_source(desc: str) -> Tuple[str, str]:
-    if not desc:
-        return "", ""
-    lines = [l.strip() for l in desc.splitlines()]
-    for i, line in enumerate(lines):
-        if "資料來源" in line:
-            head = "\n".join(lines[:i]).strip()
-            if "：" in line:
-                return head, line.split("：", 1)[1].strip()
-            if i + 1 < len(lines):
-                return head, lines[i + 1].strip()
-            return head, ""
-    return desc.strip(), ""
+def _strip_change_phrases(text: str) -> str:
+    """
+    移除『較上年度/較上一年度/比上年度/差額/變動』等片語，
+    讓題庫匹配只看主題。
+    """
+    t = str(text or "")
+    t = _CHANGE_RE.sub("", t)
+    for w in ["變動", "差額", "差距", "增減", "較去年", "比去年", "上一年度", "上年度", "前一年度", "前年度"]:
+        t = t.replace(w, "")
+    return t.strip()
 
 
-def _clean_source(src: str) -> str:
-    if not src:
-        return ""
-    s = src.strip()
-    if s.lower() == "nan":
-        return ""
-    if s in {"）", "(", "（", ")"}:
-        return ""
-    return s
-
-
-# =========================
-# 資料結構
-# =========================
-@dataclass
+@dataclass(frozen=True)
 class Entry:
     keyword: str
     keyword_norm: str
-    year: Optional[int]
+    keyword_norm_noyear: str
+    year: Optional[str]
     description: str
     unit: str
     source_url: str
 
 
-@dataclass
+@dataclass(frozen=True)
 class ChangeEntry:
     keyword: str
     keyword_norm: str
-    year: int
-    value: int
+    keyword_norm_noyear: str
+    year: Optional[str]
+    value: Optional[int]
     unit: str
-    source_name: str
+    source_url_name: str
+    source_url: str
 
 
-# =========================
-# 載入資料
-# =========================
+
+
+@dataclass(frozen=True)
+class AdminEntry:
+    keyword: str
+    keyword_norm: str
+    year: Optional[str]
+    district: str
+    topic: str
+    value: Optional[float]
+    unit: str
+    source_url_name: str
+    source_url: str
+
+_EXACT_MAP: Dict[str, Entry] = {}
 _ENTRIES: List[Entry] = []
-_EXACT: Dict[str, Entry] = {}
 
 _CHANGE_ENTRIES: List[ChangeEntry] = []
-_CHANGE_AVAILABLE = False
+_CHANGE_AVAILABLE: bool = False
+_ADMIN_ENTRIES: List[AdminEntry] = []
+_ADMIN_EXACT_MAP: Dict[str, AdminEntry] = {}
+_ADMIN_DISTRICTS: List[str] = []  # 長字先比對
+_ADMIN_AVAILABLE: bool = False
+
+
+
+def _format_answer(entry: Entry) -> str:
+    """
+    回覆內容僅回傳 description（不在訊息中顯示連結），
+    以免佔用 LINE 版面；連結建議集中於圖文選單。
+    """
+    return entry.description
+
+
+def _split_desc_and_source(description: str) -> tuple[str, str]:
+    """將 description 拆成：主內容、資料來源(若有)。
+    允許以下型態：
+    - （資料來源）\nXXX
+    - (資料來源)\nXXX
+    - 資料來源：XXX
+    - （資料來源） XXX
+    """
+    if not description:
+        return "", ""
+    text = str(description).replace("\r\n", "\n").replace("\r", "\n")
+    lines = [ln.rstrip() for ln in text.split("\n")]
+
+    # 1) 逐行找「資料來源」標記
+    marker_idx = None
+    for i, ln in enumerate(lines):
+        t = ln.strip()
+        if not t:
+            continue
+        if "資料來源" in t:
+            # 優先辨識像「（資料來源）」這種單行 marker
+            # 或「資料來源：」在同一行後面有來源
+            marker_idx = i
+            break
+
+    if marker_idx is None:
+        return text.strip(), ""
+
+    head = "\n".join(lines[:marker_idx]).strip()
+
+    marker_line = lines[marker_idx].strip()
+
+    # 2) 同一行就帶來源，例如：資料來源：XXX / （資料來源）XXX
+    m = re.search(r"資料來源[）)】\]:：\s]*\s*(.+)$", marker_line)
+    if m and m.group(1).strip():
+        src = m.group(1).strip()
+        return head, src
+
+    # 3) 來源在下一行（取第一個非空行）
+    src = ""
+    for j in range(marker_idx + 1, len(lines)):
+        t = lines[j].strip()
+        if t:
+            src = t
+            break
+
+    return head, src
+
+
+def _clean_source_name(source_text: str) -> str:
+    """清理來源文字（避免來源欄位本身已含『資料來源』字樣造成重覆）。"""
+    if not source_text:
+        return ""
+    head, src = _split_desc_and_source(str(source_text))
+    # 若 split 有抓到來源，優先用來源；否則用原文字
+    return (src or head or "").strip()
+
+def _safe_int(s: str) -> Optional[int]:
+    if s is None:
+        return None
+    t = str(s).strip()
+    if not t:
+        return None
+    t = t.replace(",", "")
+    m = re.search(r"-?\d+", t)
+    if not m:
+        return None
+    try:
+        return int(m.group(0))
+    except Exception:
+        return None
+
+def _safe_float(s: str) -> Optional[float]:
+    if s is None:
+        return None
+    t = str(s).strip()
+    if not t:
+        return None
+    t = t.replace(",", "")
+    m = re.search(r"-?\d+(?:\.\d+)?", t)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except Exception:
+        return None
+
 
 
 def _load_training() -> None:
-    global _ENTRIES, _EXACT, _CHANGE_ENTRIES, _CHANGE_AVAILABLE
+    """
+    讀取：
+      - Sheet1（主題庫：keywords/description/unit/source_url）
+      - 變動（若存在：class/keywords/unit/value/source_url_name/source_url）
+    """
+    global _EXACT_MAP, _ENTRIES, _CHANGE_ENTRIES, _CHANGE_AVAILABLE
 
     if not os.path.exists(DATA_PATH):
+        print(f"[ERROR] training file not found: {DATA_PATH}")
+        _EXACT_MAP, _ENTRIES = {}, []
+        _CHANGE_ENTRIES, _CHANGE_AVAILABLE = [], False
         return
 
-    # -------- sheet1 --------
+    # ---- 主題庫（Sheet1）----
     df = pd.read_excel(DATA_PATH, sheet_name=0, dtype=str).fillna("")
-    entries: Dict[Optional[int], List[Entry]] = {}
-    exact: Dict[str, Entry] = {}
+    cols = [c.strip().lower() for c in df.columns]
+    colmap = {c.strip().lower(): c for c in df.columns}
 
-    for _, r in df.iterrows():
-        kw = str(r.get("keywords", "")).strip()
-        desc = str(r.get("description", "")).strip()
-        if not kw or not desc:
-            continue
+    required = ["keywords", "description", "source_url"]
+    missing = [c for c in required if c not in cols]
+    if missing:
+        print(f"[ERROR] training file missing columns: {missing}. Found: {list(df.columns)}")
+        _EXACT_MAP, _ENTRIES = {}, []
+    else:
+        kw_col = colmap["keywords"]
+        desc_col = colmap["description"]
+        src_col = colmap["source_url"]
+        unit_col = colmap.get("unit")  # unit 欄可有可無
 
-        year = _extract_year(kw)
-        e = Entry(
-            keyword=kw,
-            keyword_norm=_normalize(kw),
-            year=year,
-            description=desc,
-            unit=str(r.get("unit", "")).strip(),
-            source_url=str(r.get("source_url", "")).strip(),
-        )
-        entries.setdefault(year, []).append(e)
-        exact[_normalize(kw)] = e
+        exact_map: Dict[str, Entry] = {}
+        entries: List[Entry] = []
 
-    _ENTRIES = [e for v in entries.values() for e in v]
-    _EXACT = exact
+        for _, r in df.iterrows():
+            kw_raw = str(r.get(kw_col, "")).strip()
+            desc = str(r.get(desc_col, "")).strip()
+            src = str(r.get(src_col, "")).strip()
+            unit = str(r.get(unit_col, "")).strip() if unit_col else ""
 
-    # -------- 變動 --------
-    _CHANGE_ENTRIES = []
-    try:
-        cdf = pd.read_excel(DATA_PATH, sheet_name="變動", dtype=str).fillna("")
-        for _, r in cdf.iterrows():
-            kw = str(r.get("keywords", "")).strip()
-            val = str(r.get("value", "")).strip()
-            if not kw or not val:
+            if not kw_raw or not desc:
                 continue
 
-            year = _extract_year(kw)
-            if not year:
-                continue
+            kw_norm = _normalize(kw_raw)
+            y = _extract_year(kw_raw)
+            kw_norm_noyear = _strip_year(kw_norm)
 
-            # 允許 value 含逗號或其他符號
-            v = re.sub(r"[^\d\-]", "", val)
-            if v == "" or v == "-":
-                continue
-
-            _CHANGE_ENTRIES.append(
-                ChangeEntry(
-                    keyword=kw,
-                    keyword_norm=_normalize(kw),
-                    year=year,
-                    value=int(v),
-                    unit=str(r.get("unit", "")).strip(),
-                    source_name=str(r.get("source_url_name", "")).strip(),
-                )
+            e = Entry(
+                keyword=kw_raw,
+                keyword_norm=kw_norm,
+                keyword_norm_noyear=kw_norm_noyear,
+                year=y,
+                description=desc,
+                unit=unit,
+                source_url=src,
             )
-        _CHANGE_AVAILABLE = len(_CHANGE_ENTRIES) > 0
+            exact_map[kw_norm] = e
+            entries.append(e)
+
+        _EXACT_MAP, _ENTRIES = exact_map, entries
+        print(f"[DEBUG] training loaded: {DATA_PATH}, entries={len(_ENTRIES)}")
+
+    # ---- 變動（可選）----
+    change_entries: List[ChangeEntry] = []
+    change_available = False
+    try:
+        xl = pd.ExcelFile(DATA_PATH)
+        sheet_name = None
+        for sn in xl.sheet_names:
+            if str(sn).strip() == "變動":
+                sheet_name = sn
+                break
+
+        if sheet_name:
+            cdf = pd.read_excel(DATA_PATH, sheet_name=sheet_name, dtype=str).fillna("")
+            ccols = [c.strip().lower() for c in cdf.columns]
+            cmap = {c.strip().lower(): c for c in cdf.columns}
+
+            # 允許欄位彈性（缺少就用空字串）
+            kw_col2 = cmap.get("keywords")
+            val_col = cmap.get("value")
+            unit_col2 = cmap.get("unit")
+            name_col = cmap.get("source_url_name")
+            src_col2 = cmap.get("source_url")
+
+            if kw_col2 and val_col:
+                for _, r in cdf.iterrows():
+                    kw_raw = str(r.get(kw_col2, "")).strip()
+                    if not kw_raw:
+                        continue
+                    kw_norm = _normalize(kw_raw)
+                    y = _extract_year(kw_raw)
+                    kw_norm_noyear = _strip_year(kw_norm)
+
+                    v = _safe_int(r.get(val_col, ""))
+                    unit = str(r.get(unit_col2, "")).strip() if unit_col2 else ""
+                    source_name = str(r.get(name_col, "")).strip() if name_col else ""
+                    src = str(r.get(src_col2, "")).strip() if src_col2 else ""
+
+                    change_entries.append(
+                        ChangeEntry(
+                            keyword=kw_raw,
+                            keyword_norm=kw_norm,
+                            keyword_norm_noyear=kw_norm_noyear,
+                            year=y,
+                            value=v,
+                            unit=unit,
+                            source_url_name=source_name,
+                            source_url=src,
+                        )
+                    )
+
+                change_available = len(change_entries) > 0
+                print(f"[DEBUG] change-sheet loaded: sheet=變動, rows={len(change_entries)}")
+            else:
+                print("[DEBUG] change-sheet exists but missing required columns (keywords/value). Skip.")
+    except Exception as e:
+        # 沒有變動sheet：不視為錯誤
+        print(f"[DEBUG] change-sheet not loaded: {e}")
+
+    _CHANGE_ENTRIES, _CHANGE_AVAILABLE = change_entries, change_available
+    # ---- 行政區（可選）----
+    admin_entries: List[AdminEntry] = []
+    admin_map: Dict[str, AdminEntry] = {}
+    districts: set[str] = set()
+    admin_available = False
+    try:
+        xl = pd.ExcelFile(DATA_PATH)
+        sheet_name = None
+        for sn in xl.sheet_names:
+            if str(sn).strip() == "行政區":
+                sheet_name = sn
+                break
+
+        if sheet_name:
+            adf = pd.read_excel(DATA_PATH, sheet_name=sheet_name, dtype=str).fillna("")
+            amap = {c.strip().lower(): c for c in adf.columns}
+
+            kw_col = amap.get("keywords")
+            val_col = amap.get("value")
+            unit_col = amap.get("unit")
+            srcn_col = amap.get("source_url_name")
+            src_col = amap.get("source_url")
+
+            if kw_col and val_col:
+                for _, r in adf.iterrows():
+                    kw_raw = str(r.get(kw_col, "")).strip()
+                    if not kw_raw:
+                        continue
+                    y = _extract_year(kw_raw)
+                    if not y:
+                        continue
+
+                    m = re.search(r"\d{3}\s*年\s*(?P<d>[^\d\s]{1,8}區)", kw_raw)
+                    district = m.group("d") if m else ""
+                    if district:
+                        districts.add(district)
+
+                    topic = re.sub(r"\d{3}\s*年\s*", "", kw_raw)
+                    if district:
+                        topic = topic.replace(district, "")
+                    topic = topic.strip()
+
+                    v = _safe_float(r.get(val_col, ""))
+                    if v is None:
+                        continue
+
+                    unit = str(r.get(unit_col, "")).strip() if unit_col else ""
+                    srcn = str(r.get(srcn_col, "")).strip() if srcn_col else ""
+                    src = str(r.get(src_col, "")).strip() if src_col else ""
+
+                    e = AdminEntry(
+                        keyword=kw_raw,
+                        keyword_norm=_normalize(kw_raw),
+                        year=y,
+                        district=district,
+                        topic=topic,
+                        value=v,
+                        unit=unit,
+                        source_url_name=srcn,
+                        source_url=src,
+                    )
+                    admin_entries.append(e)
+                    admin_map[e.keyword_norm] = e
+
+                admin_available = len(admin_entries) > 0
     except Exception:
-        _CHANGE_AVAILABLE = False
+        admin_available = False
+
+    globals()["_ADMIN_ENTRIES"] = admin_entries
+    globals()["_ADMIN_EXACT_MAP"] = admin_map
+    globals()["_ADMIN_DISTRICTS"] = sorted(list(districts), key=len, reverse=True)
+    globals()["_ADMIN_AVAILABLE"] = admin_available
+
 
 
 _load_training()
 
-# =========================
-# 回覆格式
-# =========================
-def _format_answer(entry: Entry) -> str:
-    desc = entry.description or ""
-    head, src_desc = _split_desc_and_source(desc)
 
-    src = _clean_source(src_desc)
-    if not src:
-        src = _clean_source(entry.source_url)
-
-    head = head.strip()
-
-    if head and src:
-        return f"{head}\n\n資料來源：{src}"
-    if head:
-        return head
-    if src:
-        return f"資料來源：{src}"
-    return ""
+def _match_by_exact(user_text: str) -> Optional[Entry]:
+    key = _normalize(user_text)
+    if not key:
+        return None
+    return _EXACT_MAP.get(key)
 
 
-def _format_answer_body_only(entry: Entry) -> Tuple[str, str]:
-    """
-    回傳：(body_only, source)
-    - body_only：不含「資料來源」的主內容
-    - source：清理後的資料來源文字（可能為空）
-    """
-    desc = entry.description or ""
-    head, src_desc = _split_desc_and_source(desc)
-    src = _clean_source(src_desc) or _clean_source(entry.source_url)
-    return head.strip(), src
+def _coverage_ratio(keyword_norm: str, user_norm: str) -> float:
+    if not keyword_norm:
+        return 0.0
+    kw = Counter(keyword_norm)
+    us = Counter(user_norm)
+    hit = sum(min(cnt, us.get(ch, 0)) for ch, cnt in kw.items())
+    return hit / max(1, len(keyword_norm))
 
 
-# =========================
-# 主邏輯
-# =========================
-def _find_entry(year: int, topic: str) -> Optional[Entry]:
-    topic_norm = _normalize(topic)
+def _rank_matches(user_text: str, use_year_filter: bool = True) -> List[Tuple[float, int, Entry]]:
+    user_norm = _normalize(user_text)
+    if not user_norm:
+        return []
+
+    user_year = _extract_year(user_text) if use_year_filter else None
+
+    candidates = _ENTRIES
+    if user_year and use_year_filter:
+        candidates = [e for e in candidates if e.year == user_year]
+
+    ranked: List[Tuple[float, int, Entry]] = []
+    for e in candidates:
+        r = _coverage_ratio(e.keyword_norm, user_norm)
+        tie = len(e.keyword_norm)
+        ranked.append((r, tie, e))
+
+    ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return ranked
+
+
+def _rank_matches_noyear(user_text: str) -> List[Tuple[float, int, Entry]]:
+    user_norm = _normalize(user_text)
+    if not user_norm:
+        return []
+
+    user_norm_noyear = _strip_year(user_norm)
+    if not user_norm_noyear:
+        return []
+
+    ranked: List[Tuple[float, int, Entry]] = []
     for e in _ENTRIES:
-        if e.year == year and topic_norm in e.keyword_norm:
-            return e
+        r = _coverage_ratio(e.keyword_norm_noyear, user_norm_noyear)
+        tie = len(e.keyword_norm_noyear)
+        ranked.append((r, tie, e))
+
+    ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return ranked
+
+
+def build_reply_single_year(user_text: str) -> str:
+    """
+    單年度查詢邏輯（保留原本互動文案/候選提示）。
+    """
+    text = (user_text or "").strip()
+    if not text:
+        return DEFAULT_REPLY
+
+    user_norm = _normalize(text)
+    user_year = _extract_year(text)
+
+    # 1) 少打年度：先提醒補年度（優先於太短引導）
+    if not user_year:
+        ranked_noyear = _rank_matches_noyear(text)
+        if ranked_noyear:
+            best_r2, _, _ = ranked_noyear[0]
+            if best_r2 >= COVERAGE_THRESHOLD:
+                return (
+                    "看起來您可能少輸入「年度」。\n"
+                    "請在問題前面加上年度（例如：113年）再查詢一次。"
+                )
+
+    # 2) 太短引導
+    if len(user_norm) < MIN_QUERY_LEN:
+        return (
+            "請輸入更完整的查詢關鍵詞（含年度/單位/指標），例如：\n"
+            "- 113年工務局主管預算數\n"
+            "- 113年工務局主管經常門\n"
+            "- 113年工務局暨所屬職員人數"
+        )
+
+    # 3) 完全符合
+    e_exact = _match_by_exact(text)
+    if e_exact:
+        return _format_answer(e_exact)
+
+    # 4) 年度一致下的覆蓋率比對
+    ranked = _rank_matches(text, use_year_filter=True)
+    if ranked:
+        best_r, _, best_e = ranked[0]
+        if best_r >= COVERAGE_THRESHOLD:
+            return _format_answer(best_e)
+
+    # 5) 關鍵詞不夠完整：列出最接近 3 筆（不顯示相符率）
+    if ranked:
+        best_r, _, _ = ranked[0]
+        if best_r >= SUGGEST_THRESHOLD:
+            picks = ranked[:SUGGEST_TOPN]
+            lines = "\n".join([f"- {e.keyword}" for _, _, e in picks])
+            return (
+                "您是不是要找下列資料：\n"
+                f"{lines}\n"
+                "（若都不是，請再補充更完整的關鍵詞，例如：年度＋單位＋項目＋職等/門別）"
+            )
+
+    return DEFAULT_REPLY
+
+
+# =========================
+# 多年度專用
+# =========================
+def _get_entry_for_year_query(query_text: str) -> Optional[Entry]:
+    """
+    多年度用：給定「已含年度」的 query（例如：113年工務局職員人數），
+    直接回傳最可能的 Entry；找不到就回 None。
+    """
+    text = (query_text or "").strip()
+    if not text:
+        return None
+
+    # 1) 完全符合
+    e_exact = _match_by_exact(text)
+    if e_exact:
+        return e_exact
+
+    # 2) 年度一致下的覆蓋率比對（多年度不做候選提示）
+    ranked = _rank_matches(text, use_year_filter=True)
+    if ranked:
+        best_r, _, best_e = ranked[0]
+        if best_r >= COVERAGE_THRESHOLD:
+            return best_e
+
     return None
 
 
-def _format_multiyear_reply(text: str) -> str:
-    years = _extract_year_range(text)
+def _extract_total_value(desc_text: str) -> Optional[int]:
+    """從 description 抓總計/總數/合計後面的數字（允許逗號）。"""
+    if not desc_text:
+        return None
+    m = re.search(r"(總計|總數|合計)\s*([\d,]+)", desc_text)
+    if not m:
+        return None
+    return int(m.group(2).replace(",", ""))
+
+
+def _fallback_extract_unit(desc_text: str) -> str:
+    """
+    若 unit 欄沒填，從 description 嘗試抓短單位（避免完全沒單位）。
+    例：總計524人 / 總計8,194,228千元
+    """
+    if not desc_text:
+        return ""
+    m = re.search(r"(總計|總數|合計)\s*[\d,]+\s*([^\d\s，。；;、()（）]{1,8})", desc_text)
+    return (m.group(2) or "").strip() if m else ""
+
+
+def _extract_source_text_and_url(ans_text: str) -> Tuple[str, str]:
+    """
+    舊版曾從回覆中擷取資料來源/URL。
+    目前回覆不顯示 URL，但仍保留方法以相容舊資料格式。
+    """
+    if not ans_text:
+        return "", ""
+    lines = [l.strip() for l in ans_text.splitlines() if l.strip()]
+    source_text = ""
+    source_url = ""
+    for i, line in enumerate(lines):
+        if not source_url:
+            m = re.search(r"(https?://\S+)", line)
+            if m:
+                source_url = m.group(1)
+        if "資料來源" in line and i + 1 < len(lines):
+            source_text = lines[i + 1]
+    return source_text, source_url
+
+
+def _format_multiyear_reply(
+    years: List[int],
+    year_to_entry: Dict[int, Optional[Entry]],
+    base_topic: str,
+    show_summary: bool,
+) -> str:
+    """
+    多年度格式化：
+    - 一行一年度：113年XXX總計NN{unit}
+    - 缺漏年度集中列示
+    - show_summary=True：加趨勢摘要 + 年度差異摘要（用同一單位）
+    """
     if not years:
+        return DEFAULT_REPLY
+
+    lines_out: List[str] = []
+    missing: List[int] = []
+    totals: Dict[int, int] = {}
+    unit_map: Dict[int, str] = {}
+
+    def _topic_no_suffix(topic: str) -> str:
+        t = (topic or "").strip()
+        if t.endswith("人數"):
+            t = t[:-2]
+        return t
+
+    def _format_multiyear_line(year: int, topic: str, total: Optional[int], unit: str) -> str:
+        t = _topic_no_suffix(topic)
+        if total is None:
+            return f"{year}年{t}（查無總計數字）"
+        return f"{year}年{t}總計{total:,}{unit}"
+
+    def _pick_summary_unit(years_sorted: List[int], unit_map2: Dict[int, str]) -> str:
+        for y in sorted(years_sorted, reverse=True):
+            u = (unit_map2.get(y) or "").strip()
+            if u:
+                return u
         return ""
 
-    if years == ["__TOO_LONG__"]:
-        return f"多年度查詢目前最多支援 {MAX_MULTIYEAR} 年，請縮小查詢範圍（例如：109-113年）。"
+    def _trend_sentence(years2: List[int], totals2: Dict[int, int], unit: str) -> str:
+        ys = sorted([y for y in years2 if y in totals2])
+        if len(ys) < 2:
+            return ""
+        first_y, last_y = ys[0], ys[-1]
+        first_v, last_v = totals2[first_y], totals2[last_y]
+        diff = last_v - first_v
+        base = first_v if first_v != 0 else 1
+        diff_pct = diff / base * 100.0
 
-    topic = _strip_year_range(text)
-    topic = re.sub(r"[？\?！!。．，,]+", "", topic).strip()
-    if not topic:
-        return "請在年度區間後補充查詢主題，例如：109-113年工務局所屬職員人數。"
+        series = [totals2[y] for y in ys]
+        avg = sum(series) / max(1, len(series))
+        rng = max(series) - min(series)
+        vol_ratio = (rng / avg) if avg != 0 else 0.0
 
-    lines: List[str] = []
-    picked_source = ""
+        if abs(diff_pct) < 1.0:
+            overall = "整體大致持平"
+        else:
+            overall = "整體呈現成長" if diff > 0 else "整體呈現下降"
 
-    for y in years:
-        e = _find_entry(y, topic)
+        if vol_ratio <= 0.03:
+            volatility = "相對穩定"
+        elif vol_ratio <= 0.08:
+            volatility = "呈現小幅波動"
+        else:
+            volatility = "波動較明顯"
+
+        recent_phrase = ""
+        if len(ys) >= 2:
+            prev_y = ys[-2]
+            prev_v = totals2[prev_y]
+            recent_diff = last_v - prev_v
+            if recent_diff > 0:
+                recent_phrase = f"{last_y}年較前期略為回升"
+            elif recent_diff < 0:
+                recent_phrase = f"{last_y}年較前期略為下滑"
+            else:
+                recent_phrase = f"{last_y}年與前期持平"
+
+        period = f"{first_y}–{last_y}年"
+        main = f"{period}{overall}，走勢{volatility}"
+        unit_hint = f"（單位：{unit}）" if unit else ""
+        return f"（趨勢摘要）\n{main}，{recent_phrase}。{unit_hint}" if recent_phrase else f"（趨勢摘要）\n{main}。{unit_hint}"
+
+    for y in sorted(years, reverse=True):
+        e = year_to_entry.get(y)
         if not e:
-            lines.append(f"{y}年{topic}：查無資料")
+            missing.append(y)
             continue
 
-        body, src = _format_answer_body_only(e)
-        m = re.search(rf"{y}年.*?總計[\d,]+[^，。,]*", body)
-        if m:
-            lines.append(m.group(0) + "。")
-        else:
-            lines.append(f"{y}年{topic}：查無資料")
-        if not picked_source and src:
-            picked_source = src
+        total = _extract_total_value(e.description)
+        unit = (e.unit or "").strip()
+        if not unit:
+            unit = _fallback_extract_unit(e.description)
 
-    if picked_source:
-        lines.append(f"\n資料來源：{picked_source}")
+        unit_map[y] = unit
+        if total is not None:
+            totals[y] = total
+
+        lines_out.append(_format_multiyear_line(y, base_topic, total, unit))
+
+    body = "\n".join(lines_out) if lines_out else "（本次範圍內皆查無符合資料）"
+
+    if missing:
+        miss = "、".join([f"{m}年" for m in sorted(missing, reverse=True)])
+        body = f"{body}\n\n（查無資料年度：{miss}）"
+
+    if show_summary and len(totals) >= 2:
+        summary_unit = _pick_summary_unit(years, unit_map)
+        trend = _trend_sentence(years, totals, summary_unit)
+        if trend:
+            body = f"{body}\n\n{trend}"
+
+        ys = sorted(totals.keys())
+        summary_unit = _pick_summary_unit(ys, unit_map)
+
+        summary_lines = ["（年度差異摘要）"]
+        for i in range(1, len(ys)):
+            y1, y2 = ys[i - 1], ys[i]
+            v1, v2 = totals[y1], totals[y2]
+            diff = v2 - v1
+            pct = (diff / v1 * 100) if v1 != 0 else 0.0
+            sign = "+" if diff >= 0 else ""
+            summary_lines.append(f"{y2}年較{y1}年 {sign}{diff:,}{summary_unit}（{sign}{pct:.2f}%）")
+
+        body = f"{body}\n\n" + "\n".join(summary_lines)
+
+    # 補上資料來源（多年度系列只顯示一次，優先取最新年度）
+    source_name = ""
+    for y in sorted(years, reverse=True):
+        e = year_to_entry.get(y)
+        if not e:
+            continue
+        # 先從 description 解析
+        src_text, _ = _extract_source_text_and_url(e.description)
+        source_name = _clean_source_name(src_text)
+        if source_name:
+            break
+        # 若 description 沒有，嘗試用 split（兼容『（資料來源）XXX』同一行）
+        _, src2 = _split_desc_and_source(e.description)
+        source_name = _clean_source_name(src2)
+        if source_name:
+            break
+
+    if source_name:
+        body = f"{body}\n\n（資料來源）\n{source_name}"
+
+    return body
+
+
+# =========================
+# 較上年度比較（使用 變動 工作表優先）
+# =========================
+def _rank_change_matches_for_year(year: int, topic: str) -> List[Tuple[float, int, ChangeEntry]]:
+    """
+    在「變動」工作表中，找同年度且主題最接近者。
+    topic：不含年度的主題字串
+    """
+    if not _CHANGE_AVAILABLE:
+        return []
+
+    topic_norm = _normalize(topic)
+    topic_norm_noyear = _strip_year(topic_norm)
+
+    ranked: List[Tuple[float, int, ChangeEntry]] = []
+    for e in _CHANGE_ENTRIES:
+        if not e.year:
+            continue
+        if int(e.year) != int(year):
+            continue
+        r = _coverage_ratio(e.keyword_norm_noyear, topic_norm_noyear)
+        tie = len(e.keyword_norm_noyear)
+        ranked.append((r, tie, e))
+    ranked.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    return ranked
+
+
+def _get_value_for_year_topic(year: int, topic: str) -> Tuple[Optional[int], str, str]:
+    """
+    回傳：(value, unit, source_name)
+    1) 優先從「變動」工作表取 value/unit/source_url_name
+    2) 若沒有變動工作表或找不到，回退到 Sheet1：從 description 抓總計數字與 unit
+    """
+    # 1) 變動工作表
+    ranked = _rank_change_matches_for_year(year, topic)
+    if ranked:
+        best_r, _, best = ranked[0]
+        if best_r >= COVERAGE_THRESHOLD and best.value is not None:
+            unit = (best.unit or "").strip()
+            source_name = _clean_source_name((best.source_url_name or "").strip())
+            return best.value, unit, source_name
+
+    # 2) 回退：Sheet1
+    q = f"{year}年{topic}"
+    e = _get_entry_for_year_query(q)
+    if not e:
+        return None, "", ""
+    total = _extract_total_value(e.description)
+    unit = (e.unit or "").strip() or _fallback_extract_unit(e.description)
+    # 嘗試抓資料來源文字（沒有就留空）
+    source_text, _ = _extract_source_text_and_url(e.description)
+    source_name = source_text.strip()
+    return total, unit, source_name
+
+
+def _format_change_reply(user_text: str) -> str:
+    """
+    例：113年工務局暨所屬職員人數較上一年度變動？
+    """
+    text = (user_text or "").strip()
+    if not text:
+        return DEFAULT_REPLY
+
+    y_str = _extract_year(text)
+    if not y_str:
+        return "請在問題前面加上年度（例如：113年），才能計算較上年度差異。"
+
+    year = int(y_str)
+    prev = year - 1
+
+    cleaned = _strip_analysis_keywords(text)
+    cleaned = _strip_change_phrases(cleaned)
+    topic = strip_year_expression(cleaned).strip()
+    topic = re.sub(r"[？\?！!。．，,\s]+", "", topic)
+
+    if not topic:
+        return "請補充要比較的主題，例如：113年工務局暨所屬職員人數較上一年度變動？"
+
+    v_now, unit_now, src_now = _get_value_for_year_topic(year, topic)
+    v_prev, unit_prev, src_prev = _get_value_for_year_topic(prev, topic)
+
+    # 單位：以當年度優先
+    unit = (unit_now or unit_prev or "").strip()
+
+    # 資料來源：以當年度優先
+    source_name = (src_now or src_prev or "").strip()
+
+    # 若任一年度查不到
+    if v_now is None and v_prev is None:
+        return DEFAULT_REPLY
+    if v_now is None:
+        return f"{year}年{topic}（查無資料，無法計算較{prev}年變動）"
+    if v_prev is None:
+        return f"{year}年{topic}總計{v_now:,}{unit}。\n（查無{prev}年資料，無法計算較上年度變動）"
+
+    diff = v_now - v_prev
+    sign = "增加" if diff > 0 else ("減少" if diff < 0 else "持平")
+    diff_abs = abs(diff)
+
+    pct = (diff / v_prev * 100.0) if v_prev != 0 else 0.0
+    pct_sign = "+" if pct >= 0 else ""
+
+    # 顯示主題：若以「人數」結尾，回覆上更順（職員總計...）
+    topic_display = topic
+    if topic_display.endswith("人數"):
+        topic_display = topic_display[:-2]
+
+    lines = [
+        f"{year}年{topic_display}總計{v_now:,}{unit}。",
+        f"{year}年較{prev}年{sign}{diff_abs:,}{unit}（{pct_sign}{pct:.2f}%）。",
+    ]
+
+    if source_name:
+        lines.append("（資料來源）")
+        lines.append(source_name)
 
     return "\n".join(lines)
 
 
-def _format_change_reply(text: str) -> str:
+# =========================
+# footer 分流：查到 / 查不到
+# =========================
+def _is_success_reply(reply: str) -> bool:
     """
-    以「變動」工作表計算：year vs year-1。
-    同時列出：
-      - 當年度總計
-      - 前一年度總計
-      - 差額與百分比
+    判斷「是否查到資料」：
+    - DEFAULT_REPLY -> 失敗
+    - 引導/提醒/候選 -> 視為未查到（使用 fallback 文案）
+    - 多年度全無 -> 視為未查到
+    - 其餘 -> 視為查到（使用 success 文案）
     """
+    r = (reply or "").strip()
+    if not r:
+        return False
+
+    if r == DEFAULT_REPLY:
+        return False
+
+    if r.startswith("請輸入更完整的查詢關鍵詞"):
+        return False
+    if r.startswith("看起來您可能少輸入「年度」"):
+        return False
+    if r.startswith("您是不是要找下列資料："):
+        return False
+
+    if "（本次範圍內皆查無符合資料）" in r:
+        return False
+
+    return True
+
+
+def _prepend_result_header(reply: str) -> str:
+    """
+    只有「查到資料」時才加上『查詢結果如下：』，避免干擾引導/候選訊息。
+    且避免重複加標頭。
+    """
+    r = (reply or "").strip()
+    if not r:
+        return r
+    if r.startswith(RESULT_HEADER):
+        return r
+    if _is_success_reply(r):
+        return f"{RESULT_HEADER}\n{r}"
+    return r
+
+
+def _append_survey_footer(reply: str) -> str:
+    """
+    版面精簡：不在回覆中附加「滿意度調查/回饋連結」。
+    建議改由圖文選單提供入口。
+    """
+    return (reply or "").rstrip()
+
+
+def _extract_districts_from_query(text: str) -> List[str]:
+    """從查詢句中抽出行政區（依出現順序）。"""
+    if not _ADMIN_AVAILABLE:
+        return []
+    t = str(text or "")
+    found: List[Tuple[int, str]] = []
+    for d in _ADMIN_DISTRICTS:
+        pos = t.find(d)
+        if pos >= 0:
+            found.append((pos, d))
+    found.sort(key=lambda x: x[0])
+    out: List[str] = []
+    seen = set()
+    for _, d in found:
+        if d not in seen:
+            out.append(d)
+            seen.add(d)
+    return out
+
+
+def _strip_admin_connectors(s: str) -> str:
+    for w in ["以及", "及", "與", "和", "、", "，", ",", " "]:
+        s = s.replace(w, "")
+    return s.strip()
+
+
+def _format_admin_reply(text: str) -> str:
+    """行政區查詢（使用 training.xlsx 的「行政區」工作表）。"""
+    if not _ADMIN_AVAILABLE:
+        return ""
+
     year = _extract_year(text)
     if not year:
-        return "請輸入年度後再查詢。"
+        return ""
 
-    topic = re.sub(_YEAR_RE, "", text)
-    for w in CHANGE_TIME_KEYWORDS + CHANGE_ACTION_KEYWORDS:
-        topic = topic.replace(w, "")
-    topic = topic.strip()
+    districts = _extract_districts_from_query(text)
+    if not districts:
+        return ""
 
-    cur = next((e for e in _CHANGE_ENTRIES if e.year == year and topic and topic in e.keyword), None)
-    prev = next((e for e in _CHANGE_ENTRIES if e.year == year - 1 and topic and topic in e.keyword), None)
+    topic = re.sub(r"\d{3}\s*年\s*", "", str(text))
+    for d in districts:
+        topic = topic.replace(d, "")
+    topic = _strip_admin_connectors(topic)
+    topic = re.sub(r"[？\?！!。．]+", "", topic).strip()
 
-    if not cur or not prev:
-        return DEFAULT_REPLY
+    if not topic:
+        return ""
 
-    diff = cur.value - prev.value
-    sign = "增加" if diff > 0 else "減少" if diff < 0 else "持平"
-    pct = diff / prev.value * 100 if prev.value else 0
+    lines: List[str] = []
+    picked_src = ""
 
-    lines = [
-        f"{year}年{topic}總計{cur.value:,}{cur.unit}。",
-        f"{year-1}年{topic}總計{prev.value:,}{cur.unit}。",
-        f"{year}年較{year-1}年{sign}{abs(diff):,}{cur.unit}（{pct:+.2f}%）。",
-    ]
+    for d in districts:
+        key = _normalize(f"{year}年{d}{topic}")
+        e = _ADMIN_EXACT_MAP.get(key)
+        if not e or e.value is None:
+            lines.append(f"{year}年{d}{topic}：查無資料")
+            continue
 
-    src = _clean_source(cur.source_name)
-    if src:
-        lines.append(src)
+        v = float(e.value)
+        v_str = f"{int(v):,}" if v.is_integer() else f"{v:,}"
+        unit = (e.unit or "").strip()
+        lines.append(f"{year}年{d}{topic}{v_str}{unit}")
+
+        if not picked_src:
+            src = _clean_source_name(e.source_url_name) or _clean_source_name(e.source_url)
+            src = re.sub(r"^\s*資料來源\s*[:：]\s*", "", src).strip()
+            if src:
+                picked_src = src
+
+    if picked_src:
+        lines.append(f"\n資料來源：{picked_src}")
 
     return "\n".join(lines)
 
 
 def build_reply(user_text: str) -> str:
+    """
+    入口：
+    - 若為「較上年度/變動/差額」查詢：計算 year vs year-1
+    - 若為多年度範圍：拆成多筆單年度查詢後合併
+    - 否則：走單年度流程
+
+    流程：
+    1) 產出 reply
+    2) 若查到資料 → 前置「查詢結果如下：」
+    3) 不附加外部連結 footer（由圖文選單承接）
+    """
     text = (user_text or "").strip()
     if not text:
-        return DEFAULT_REPLY
+        return _append_survey_footer(DEFAULT_REPLY)
 
-    # 1) 較上一年度（走「變動」工作表）
+    # 0) 較上年度比較（優先於多年度）
     if _is_change_query(text):
         reply = _format_change_reply(text)
-        return f"{RESULT_HEADER}\n{reply}"
+        reply = _prepend_result_header(reply)
+        return _append_survey_footer(reply)
 
-    # 2) 多年度區間（最多 5 年；逐年列示）
-    multi = _format_multiyear_reply(text)
-    if multi:
-        return f"{RESULT_HEADER}\n{multi}"
+    # 0.5) 行政區查詢（使用「行政區」工作表；不影響既有 Sheet1/變動/多年度邏輯）
+    admin_reply = _format_admin_reply(text)
+    if admin_reply:
+        reply = _prepend_result_header(admin_reply)
+        return _append_survey_footer(reply)
 
-    # 3) 一般（sheet1）
-    key = _normalize(text)
-    if key in _EXACT:
-        return f"{RESULT_HEADER}\n{_format_answer(_EXACT[key])}"
+    years = extract_years(text)
 
-    year = _extract_year(text)
-    if year:
-        topic = re.sub(_YEAR_RE, "", text).strip()
-        e = _find_entry(year, topic)
-        if e:
-            return f"{RESULT_HEADER}\n{_format_answer(e)}"
+    # 1) 多年度
+    if len(years) >= 2:
+        show_summary = _wants_summary(text)
 
-    return DEFAULT_REPLY
+        cleaned = _strip_analysis_keywords(text)
+        base_topic = strip_year_expression(cleaned)
+
+        year_to_entry: Dict[int, Optional[Entry]] = {}
+        for y in years:
+            q = f"{y}年{base_topic}"
+            year_to_entry[y] = _get_entry_for_year_query(q)
+
+        reply = _format_multiyear_reply(years, year_to_entry, base_topic, show_summary)
+        reply = _prepend_result_header(reply)
+        return _append_survey_footer(reply)
+
+    # 2) 單年度
+    reply = build_reply_single_year(text)
+    reply = _prepend_result_header(reply)
+    return _append_survey_footer(reply)
