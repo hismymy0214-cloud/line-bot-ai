@@ -317,7 +317,11 @@ def _format_multiyear_reply(text: str) -> str:
             continue
 
         body, src = _format_answer_body_only(e)
-        lines.append(body if body else f"{y}年{topic}：查無資料")
+        m = re.search(rf"({y}年.*?總計[\\d,]+人)", body)
+        if m:
+            lines.append(m.group(1) + "。")
+        else:
+            lines.append(body if body else f"{y}年{topic}：查無資料")
         if not picked_source and src:
             picked_source = src
 
