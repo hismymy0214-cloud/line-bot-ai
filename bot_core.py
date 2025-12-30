@@ -15,71 +15,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.environ.get("TRAINING_FILE", "training.xlsx")
 DATA_PATH = os.path.join(BASE_DIR, DATA_FILE)
 
-# =========================
-# （選用）語意匹配 SBERT
-# =========================
-# 預設關閉，避免影響既有行為與部署體積。
-# 若要啟用：在 Render / 環境變數加上 USE_BERT_SEMANTIC=1
-USE_BERT_SEMANTIC = os.environ.get("USE_BERT_SEMANTIC", "0") == "1"
-SBERT_MIN_SCORE = float(os.environ.get("SBERT_MIN_SCORE", "0.72"))
-
-_SEMANTIC_MATCHER = None  # lazy singleton
-
-
-def _get_semantic_matcher():
-    """Lazy-create semantic matcher.
-
-    If sentence-transformers is not installed, return None (no crash).
-    """
-    global _SEMANTIC_MATCHER
-    if _SEMANTIC_MATCHER is not None:
-        return _SEMANTIC_MATCHER
-    if not USE_BERT_SEMANTIC:
-        return None
-    try:
-        from semantic_match import SemanticMatcher
-
-        _SEMANTIC_MATCHER = SemanticMatcher(DATA_PATH)
-        return _SEMANTIC_MATCHER
-    except Exception as e:
-        print(f"[DEBUG] semantic matcher unavailable: {e}")
-        return None
-
-
-def _semantic_pick_sheet1(user_text: str, year: Optional[str]) -> Optional["Entry"]:
-    sm = _get_semantic_matcher()
-    if sm is None:
-        return None
-    try:
-        hit = sm.best_match("sheet1", user_text, year=year, min_score=SBERT_MIN_SCORE)
-        if not hit:
-            return None
-        # Map to Entry by keyword text
-        kw = sm._texts.get("sheet1", [])[hit.idx]  # type: ignore[attr-defined]
-        if not kw:
-            return None
-        return _EXACT_MAP.get(_normalize(kw))
-    except Exception as e:
-        print(f"[DEBUG] semantic_pick_sheet1 error: {e}")
-        return None
-
-
-def _semantic_pick_admin(user_text: str, year: Optional[str]) -> Optional["AdminEntry"]:
-    sm = _get_semantic_matcher()
-    if sm is None:
-        return None
-    try:
-        hit = sm.best_match("admin", user_text, year=year, min_score=SBERT_MIN_SCORE)
-        if not hit:
-            return None
-        kw = sm._texts.get("admin", [])[hit.idx]  # type: ignore[attr-defined]
-        if not kw:
-            return None
-        return _ADMIN_EXACT_MAP.get(_normalize(kw))
-    except Exception as e:
-        print(f"[DEBUG] semantic_pick_admin error: {e}")
-        return None
-
 # 覆蓋率門檻：keywords 至少 80% 被使用者輸入「涵蓋」才算命中
 COVERAGE_THRESHOLD = float(os.environ.get("COVERAGE_THRESHOLD", "0.8"))
 
@@ -672,13 +607,6 @@ def build_reply_single_year(user_text: str) -> str:
         if best_r >= COVERAGE_THRESHOLD:
             return _format_answer(best_e)
 
-    # 4.5) （選用）SBERT 語意匹配：只有在規則比對找不到時才啟用
-    # 目的：讓使用者輸入有錯字/同義詞時仍能命中既有題庫，且不影響原本命中規則。
-    if USE_BERT_SEMANTIC:
-        sem = _semantic_pick_sheet1(text, user_year)
-        if sem:
-            return _format_answer(sem)
-
     # 5) 關鍵詞不夠完整：列出最接近 3 筆（不顯示相符率）
     if ranked:
         best_r, _, _ = ranked[0]
@@ -1111,7 +1039,13 @@ def _strip_admin_connectors(s: str) -> str:
 
 
 def _format_admin_reply(text: str) -> str:
-    """行政區查詢（使用 training.xlsx 的「行政區」工作表）。"""
+    """行政區查詢（使用 training.xlsx 的「行政區」工作表）。
+
+    【跨區修正】支援輸入 2 區以上（例如：鹽埕區及三民區…）
+    - 不再用「從原句刪掉其他區名」去拼查詢字串（容易殘留『及/與/和』或『高雄市』造成比對失敗）
+    - 改為：抽出「年度」「行政區清單」「主題(topic)」，再重組成標準 keyword 去查表
+    - 同時相容 keyword 可能含/不含『高雄市』前綴（先試含市名，再試不含）
+    """
     if not _ADMIN_AVAILABLE:
         return ""
 
@@ -1123,59 +1057,59 @@ def _format_admin_reply(text: str) -> str:
     if not districts:
         return ""
 
+    # 1) 抽出主題：去年度、去城市前綴、去所有行政區、去連接詞、去標點
     topic = re.sub(r"\d{3}\s*年\s*", "", str(text))
+    topic = topic.replace("高雄市", "").replace("高雄", "")
     for d in districts:
         topic = topic.replace(d, "")
     topic = _strip_admin_connectors(topic)
-    topic = re.sub(r"[？\?！!。．]+", "", topic).strip()
-
+    topic = re.sub(r"[？\?！!。．，,、\s]+", "", topic).strip()
     if not topic:
         return ""
 
-    def _admin_best_entry(year_str: str, district: str, raw_query: str) -> Optional["AdminEntry"]:
-        """在行政區題庫內，用覆蓋率挑同年度且同區最接近者。
-
-        目的：避免『高雄市』等前綴、區名位置不同造成 exact key 對不到。
-        """
-        if not _ADMIN_AVAILABLE:
-            return None
-        qn = _normalize(raw_query)
-        best: Optional[AdminEntry] = None
-        best_r = 0.0
-        for e in _ADMIN_ENTRIES:
-            if not e.year or e.year != year_str:
-                continue
-            if district not in (e.keyword or ""):
-                continue
-            r = _coverage_ratio(e.keyword_norm, qn)
-            if r > best_r:
-                best_r = r
-                best = e
-        if best and best_r >= COVERAGE_THRESHOLD:
-            return best
-        return None
-
+    # 2) 逐區重組標準查詢字串（先試含『高雄市』，再試不含）
     lines: List[str] = []
     picked_src = ""
 
-    for d in districts:
-        # 以使用者原句為基底，只保留「該區」
-        q = str(text)
-        for od in districts:
-            if od != d:
-                q = q.replace(od, "")
-        q = _strip_admin_connectors(q)
-        q = re.sub(r"[？\?！!。．]+", "", q)
+    def _pick_entry_for_district(d: str) -> Optional[AdminEntry]:
+        # 先嘗試 exact（最準、最快）
+        candidates = [
+            f"{year}年高雄市{d}{topic}",
+            f"{year}年{d}{topic}",
+        ]
+        for cand in candidates:
+            e0 = _ADMIN_EXACT_MAP.get(_normalize(cand))
+            if e0 and e0.value is not None:
+                return e0
 
-        e = _admin_best_entry(year, d, q)
+        # 再用覆蓋率比對兜底：同年度 + keyword 含該行政區
+        want_norms = [_normalize(c) for c in candidates]
+        best_e: Optional[AdminEntry] = None
+        best_r = 0.0
+        for e in _ADMIN_ENTRIES:
+            if e.year != str(year):
+                continue
+            if d not in e.keyword:
+                continue
+            for wn in want_norms:
+                r = _coverage_ratio(e.keyword_norm, wn)
+                if r > best_r:
+                    best_r = r
+                    best_e = e
+        if best_e and best_r >= COVERAGE_THRESHOLD and best_e.value is not None:
+            return best_e
+        return None
+
+    for d in districts:
+        e = _pick_entry_for_district(d)
         if not e or e.value is None:
-            lines.append(f"{year}年{d}{topic}：查無資料")
+            lines.append(f"{year}年高雄市{d}{topic}：查無資料")
             continue
 
         v = float(e.value)
         v_str = f"{int(v):,}" if v.is_integer() else f"{v:,}"
         unit = (e.unit or "").strip()
-        lines.append(f"{year}年{d}{topic}{v_str}{unit}")
+        lines.append(f"{year}年高雄市{d}{topic}{v_str}{unit}")
 
         if not picked_src:
             src = _clean_source_name(e.source_url_name) or _clean_source_name(e.source_url)
@@ -1187,8 +1121,6 @@ def _format_admin_reply(text: str) -> str:
         lines.append(f"\n資料來源：{picked_src}")
 
     return "\n".join(lines)
-
-
 def build_reply(user_text: str) -> str:
     """
     入口：
