@@ -1019,10 +1019,20 @@ def _append_survey_footer(reply: str) -> str:
 
 
 def _extract_districts_from_query(text: str) -> List[str]:
-    """從查詢句中抽出行政區（依出現順序）。"""
+    """從查詢句中抽出行政區（依出現順序）。
+
+    修正：避免同時命中「高雄市鹽埕區」與「鹽埕區」而重覆。
+    做法：把命中的行政區統一正規化成「○○區」（去掉『高雄市/高雄』前綴）後再去重。
+    """
     if not _ADMIN_AVAILABLE:
         return []
     t = str(text or "")
+
+    def _canon(d: str) -> str:
+        d2 = str(d or "")
+        # 允許訓練檔或輸入同時存在「高雄市○○區」與「○○區」
+        d2 = d2.replace("高雄市", "").replace("高雄", "")
+        return d2
     found: List[Tuple[int, str]] = []
     for d in _ADMIN_DISTRICTS:
         pos = t.find(d)
@@ -1032,9 +1042,10 @@ def _extract_districts_from_query(text: str) -> List[str]:
     out: List[str] = []
     seen = set()
     for _, d in found:
-        if d not in seen:
-            out.append(d)
-            seen.add(d)
+        cd = _canon(d)
+        if cd and cd not in seen:
+            out.append(cd)
+            seen.add(cd)
     return out
 
 
