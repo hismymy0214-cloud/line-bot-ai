@@ -15,6 +15,71 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.environ.get("TRAINING_FILE", "training.xlsx")
 DATA_PATH = os.path.join(BASE_DIR, DATA_FILE)
 
+# =========================
+# （選用）語意匹配 SBERT
+# =========================
+# 預設關閉，避免影響既有行為與部署體積。
+# 若要啟用：在 Render / 環境變數加上 USE_BERT_SEMANTIC=1
+USE_BERT_SEMANTIC = os.environ.get("USE_BERT_SEMANTIC", "0") == "1"
+SBERT_MIN_SCORE = float(os.environ.get("SBERT_MIN_SCORE", "0.72"))
+
+_SEMANTIC_MATCHER = None  # lazy singleton
+
+
+def _get_semantic_matcher():
+    """Lazy-create semantic matcher.
+
+    If sentence-transformers is not installed, return None (no crash).
+    """
+    global _SEMANTIC_MATCHER
+    if _SEMANTIC_MATCHER is not None:
+        return _SEMANTIC_MATCHER
+    if not USE_BERT_SEMANTIC:
+        return None
+    try:
+        from semantic_match import SemanticMatcher
+
+        _SEMANTIC_MATCHER = SemanticMatcher(DATA_PATH)
+        return _SEMANTIC_MATCHER
+    except Exception as e:
+        print(f"[DEBUG] semantic matcher unavailable: {e}")
+        return None
+
+
+def _semantic_pick_sheet1(user_text: str, year: Optional[str]) -> Optional["Entry"]:
+    sm = _get_semantic_matcher()
+    if sm is None:
+        return None
+    try:
+        hit = sm.best_match("sheet1", user_text, year=year, min_score=SBERT_MIN_SCORE)
+        if not hit:
+            return None
+        # Map to Entry by keyword text
+        kw = sm._texts.get("sheet1", [])[hit.idx]  # type: ignore[attr-defined]
+        if not kw:
+            return None
+        return _EXACT_MAP.get(_normalize(kw))
+    except Exception as e:
+        print(f"[DEBUG] semantic_pick_sheet1 error: {e}")
+        return None
+
+
+def _semantic_pick_admin(user_text: str, year: Optional[str]) -> Optional["AdminEntry"]:
+    sm = _get_semantic_matcher()
+    if sm is None:
+        return None
+    try:
+        hit = sm.best_match("admin", user_text, year=year, min_score=SBERT_MIN_SCORE)
+        if not hit:
+            return None
+        kw = sm._texts.get("admin", [])[hit.idx]  # type: ignore[attr-defined]
+        if not kw:
+            return None
+        return _ADMIN_EXACT_MAP.get(_normalize(kw))
+    except Exception as e:
+        print(f"[DEBUG] semantic_pick_admin error: {e}")
+        return None
+
 # 覆蓋率門檻：keywords 至少 80% 被使用者輸入「涵蓋」才算命中
 COVERAGE_THRESHOLD = float(os.environ.get("COVERAGE_THRESHOLD", "0.8"))
 
@@ -607,6 +672,13 @@ def build_reply_single_year(user_text: str) -> str:
         if best_r >= COVERAGE_THRESHOLD:
             return _format_answer(best_e)
 
+    # 4.5) （選用）SBERT 語意匹配：只有在規則比對找不到時才啟用
+    # 目的：讓使用者輸入有錯字/同義詞時仍能命中既有題庫，且不影響原本命中規則。
+    if USE_BERT_SEMANTIC:
+        sem = _semantic_pick_sheet1(text, user_year)
+        if sem:
+            return _format_answer(sem)
+
     # 5) 關鍵詞不夠完整：列出最接近 3 筆（不顯示相符率）
     if ranked:
         best_r, _, _ = ranked[0]
@@ -1060,12 +1132,42 @@ def _format_admin_reply(text: str) -> str:
     if not topic:
         return ""
 
+    def _admin_best_entry(year_str: str, district: str, raw_query: str) -> Optional["AdminEntry"]:
+        """在行政區題庫內，用覆蓋率挑同年度且同區最接近者。
+
+        目的：避免『高雄市』等前綴、區名位置不同造成 exact key 對不到。
+        """
+        if not _ADMIN_AVAILABLE:
+            return None
+        qn = _normalize(raw_query)
+        best: Optional[AdminEntry] = None
+        best_r = 0.0
+        for e in _ADMIN_ENTRIES:
+            if not e.year or e.year != year_str:
+                continue
+            if district not in (e.keyword or ""):
+                continue
+            r = _coverage_ratio(e.keyword_norm, qn)
+            if r > best_r:
+                best_r = r
+                best = e
+        if best and best_r >= COVERAGE_THRESHOLD:
+            return best
+        return None
+
     lines: List[str] = []
     picked_src = ""
 
     for d in districts:
-        key = _normalize(f"{year}年{d}{topic}")
-        e = _ADMIN_EXACT_MAP.get(key)
+        # 以使用者原句為基底，只保留「該區」
+        q = str(text)
+        for od in districts:
+            if od != d:
+                q = q.replace(od, "")
+        q = _strip_admin_connectors(q)
+        q = re.sub(r"[？\?！!。．]+", "", q)
+
+        e = _admin_best_entry(year, d, q)
         if not e or e.value is None:
             lines.append(f"{year}年{d}{topic}：查無資料")
             continue
