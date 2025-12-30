@@ -462,10 +462,16 @@ def _load_training() -> None:
                     if not y:
                         continue
 
-                    m = re.search(r"\d{3}\s*年\s*(?P<d>[^\d\s]{1,8}區)", kw_raw)
-                    district = m.group("d") if m else ""
+                    m = re.search(r"\d{3}\s*年\s*(?P<d>[^\d\s]{1,12}區)", kw_raw)
+                    district_raw = m.group("d") if m else ""
+                    # keyword 可能寫成「113年高雄市鹽埕區...」，也可能是「113年鹽埕區...」
+                    # 這裡統一把行政區存成「不含高雄市/高雄」的形式，並同時保留原字串供 exact match
+                    district = district_raw.replace("高雄市", "").replace("高雄", "").strip()
                     if district:
                         districts.add(district)
+                    if district_raw and district_raw != district:
+                        # 也存一份含市名前綴，避免 query 真的寫「高雄市鹽埕區」時找不到
+                        districts.add(district_raw.strip())
 
                     topic = re.sub(r"\d{3}\s*年\s*", "", kw_raw)
                     if district:
@@ -1089,7 +1095,7 @@ def _format_admin_reply(text: str) -> str:
         for e in _ADMIN_ENTRIES:
             if e.year != str(year):
                 continue
-            if d not in e.keyword:
+            if (d not in e.keyword) and (f"高雄市{d}" not in e.keyword) and (f"高雄{d}" not in e.keyword):
                 continue
             for wn in want_norms:
                 r = _coverage_ratio(e.keyword_norm, wn)
